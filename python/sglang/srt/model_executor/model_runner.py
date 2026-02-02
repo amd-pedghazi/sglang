@@ -29,6 +29,7 @@ from typing import Callable, List, Optional, Tuple, Union
 import torch
 import torch.distributed as dist
 from torch import nn
+from torch.profiler import record_function
 
 from sglang.srt.configs import (
     FalconH1Config,
@@ -2203,18 +2204,48 @@ class ModelRunner(ModelRunnerKVCacheMixin):
     ) -> ModelRunnerOutput:
         self.forward_pass_id += 1
 
-        with get_global_expert_distribution_recorder().with_forward_pass(
-            self.forward_pass_id,
-            forward_batch,
-        ) as recorder_outputs:
-            output = self._forward_raw(
-                forward_batch,
-                skip_attn_backend_init,
-                pp_proxy_tensors,
-                reinit_attn_backend,
-                split_forward_count,
+        if forward_batch.forward_mode.is_decode():
+            label = "decode"
+            num_batched_tokens = forward_batch.batch_size
+        elif forward_batch.forward_mode == ForwardMode.MIXED:
+            label = "mixed"
+            num_batched_tokens = forward_batch.extend_num_tokens
+        elif forward_batch.forward_mode == ForwardMode.EXTEND:
+            label = "prefill"
+            num_batched_tokens = forward_batch.extend_num_tokens
+        else:
+            label = str(forward_batch.forward_mode).split(".")[-1].lower()
+            num_batched_tokens = (
+                forward_batch.extend_num_tokens
+                if forward_batch.extend_num_tokens is not None
+                else forward_batch.batch_size
             )
-        output.expert_distribution_metrics = recorder_outputs.get("metrics")
+
+        max_len = 0
+        if (
+            forward_batch.seq_lens_cpu is not None
+            and len(forward_batch.seq_lens_cpu) > 0
+        ):
+            max_len = forward_batch.seq_lens_cpu.max().item()
+
+        with record_function(
+            f"ModelRunner.forward ({label}) "
+            f"b={forward_batch.batch_size} "
+            f"t={num_batched_tokens} "
+            f"max_len={max_len}"
+        ):
+            with get_global_expert_distribution_recorder().with_forward_pass(
+                self.forward_pass_id,
+                forward_batch,
+            ) as recorder_outputs:
+                output = self._forward_raw(
+                    forward_batch,
+                    skip_attn_backend_init,
+                    pp_proxy_tensors,
+                    reinit_attn_backend,
+                    split_forward_count,
+                )
+            output.expert_distribution_metrics = recorder_outputs.get("metrics")
 
         # Copy cached routing experts' buffers back to CPU cache
         get_global_experts_capturer().on_forward_end(
