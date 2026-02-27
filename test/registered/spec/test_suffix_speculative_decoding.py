@@ -33,11 +33,8 @@ GSM_DATASET_PATH = None
 # Default server arguments shared across all tests
 DEFAULT_SERVER_ARGS = [
     "--trust-remote-code",
-    "--tp",
-    "1",
-    "--enable-metrics",
-    "--model-loader-extra-config",
-    '{"enable_multithread_load": true, "num_threads": 8}',
+    "--cuda-graph-max-bs",
+    "8",
     "--speculative-algorithm",
     "SUFFIX",
     "--speculative-num-draft-tokens",
@@ -47,16 +44,8 @@ DEFAULT_SERVER_ARGS = [
     "--speculative-suffix-min-token-prob",
     "0.2",
     "--mem-fraction-static",
-    "0.8",
+    0.8,
 ]
-
-# AMD env vars for the integration tests
-DEFAULT_ENV = {
-    "AITER_ONLINE_TUNE": "1",
-    "SGLANG_AITER_MLA_PERSIST": "1",
-    "SGLANG_USE_AITER": "1",
-    "SAFETENSORS_FAST_GPU": "1",
-}
 
 
 # ---------------------------------------------------------------------------
@@ -67,10 +56,10 @@ DEFAULT_ENV = {
 class TestSuffixDecodingBase(GSM8KMixin, CustomTestCase):
     """Base integration test for suffix decoding."""
 
-    model = "zai-org/GLM-4.7-FP8"
+    model = DEFAULT_TARGET_MODEL_NGRAM
     base_url = DEFAULT_URL_FOR_TEST
     gsm8k_accuracy_thres = 0.79
-    gsm8k_accept_length_thres = 1.5
+    gsm8k_accept_length_thres = 1.3
 
     @classmethod
     def get_server_args(cls):
@@ -80,9 +69,9 @@ class TestSuffixDecodingBase(GSM8KMixin, CustomTestCase):
     def setUpClass(cls):
         envs.SGLANG_JIT_DEEPGEMM_PRECOMPILE.set(False)
         envs.SGLANG_ENABLE_JIT_DEEPGEMM.set(False)
-        os.environ.update(DEFAULT_ENV)
+        model = cls.model
         cls.process = popen_launch_server(
-            cls.model,
+            model,
             cls.base_url,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
             other_args=cls.get_server_args(),
