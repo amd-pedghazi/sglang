@@ -34,7 +34,7 @@ GSM_DATASET_PATH = None
 DEFAULT_SERVER_ARGS = [
     "--trust-remote-code",
     "--tp",
-    "8",
+    "1",
     "--enable-metrics",
     "--model-loader-extra-config",
     '{"enable_multithread_load": true, "num_threads": 8}',
@@ -99,6 +99,10 @@ class TestSuffixDecodingTriton(TestSuffixDecodingBase):
         return DEFAULT_SERVER_ARGS + ["--attention-backend", "triton"]
 
 
+@unittest.skipIf(
+    os.environ.get("SGLANG_IS_IN_CI_AMD", "0") == "1",
+    "flashinfer attention backend is not supported on ROCm",
+)
 class TestSuffixDecodingFlashinfer(TestSuffixDecodingBase):
     @classmethod
     def get_server_args(cls):
