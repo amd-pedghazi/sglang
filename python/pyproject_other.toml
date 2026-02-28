@@ -17,6 +17,7 @@ dependencies = ["aiohttp", "requests", "tqdm", "numpy", "IPython", "setproctitle
 
 [project.optional-dependencies]
 runtime_common = [
+  "arctic-inference==0.1.1",
   "IPython",
   "aiohttp",
   "anthropic>=0.20.0",
@@ -80,7 +81,6 @@ tracing = [
 # => base docker rocm/vllm-dev:20250114, not from public vllm whl
 srt_hip = [
   "sglang[runtime_common]",
-  "arctic-inference==0.1.1",
   "torch",
   "petit_kernel==0.0.2",
   "wave-lang==3.8.2",
