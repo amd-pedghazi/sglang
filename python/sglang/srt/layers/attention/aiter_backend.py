@@ -92,7 +92,9 @@ class ForwardMetadata:
     qo_indptr: torch.Tensor
     kv_last_page_len: torch.Tensor
     max_q_len: int
-    max_kv_len: Optional[int]
+    max_kv_len: Optional[
+        int
+    ]  # total KV pages from kv_indptr[-1]; required by aiter attention for speculative decoding paths
     work_metadata: Optional[torch.Tensor] = None
     work_info_set: Optional[torch.Tensor] = None
     work_indptr: Optional[torch.Tensor] = None
@@ -627,7 +629,7 @@ class AiterAttnBackend(AttentionBackend):
                     qo_indptr,
                     None,
                     draft_max_extend_len,
-                    None,
+                    kv_indptr[-1].item(),
                     custom_mask=custom_mask,
                     mask_indptr=None,
                     max_extend_len=draft_max_extend_len,
@@ -702,7 +704,7 @@ class AiterAttnBackend(AttentionBackend):
                     # self.mla_indices_updater_prefill.kv_last_page_len,
                     self.kv_last_page_len[:bs],
                     draft_num,
-                    None,
+                    kv_indptr[-1].item(),
                     work_metadata=work_metadata,
                     work_info_set=work_info_set,
                     work_indptr=work_indptr,
@@ -753,7 +755,7 @@ class AiterAttnBackend(AttentionBackend):
                     qo_indptr,
                     None,
                     draft_num,
-                    None,
+                    kv_indptr[-1].item(),
                     custom_mask=custom_mask,
                     mask_indptr=mask_indptr,
                     max_extend_len=draft_num,
@@ -1169,7 +1171,7 @@ class AiterAttnBackend(AttentionBackend):
                     qo_indptr,
                     None,
                     num_tokens_per_bs,
-                    None,
+                    kv_indptr[-1].item(),
                     custom_mask=None,
                     mask_indptr=None,
                     max_extend_len=num_tokens_per_bs,
