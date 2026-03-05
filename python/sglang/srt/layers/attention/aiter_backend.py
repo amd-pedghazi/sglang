@@ -1072,6 +1072,8 @@ class AiterAttnBackend(AttentionBackend):
                     num_kv_splits=num_kv_splits,
                 )
             else:
+                # Non-MLA target_verify cuda graph: use triton extend kernel metadata
+                draft_num = self.num_draft_tokens
                 custom_mask = self.cuda_graph_custom_mask
                 if spec_info is not None and spec_info.custom_mask is not None:
                     custom_mask[: spec_info.custom_mask.shape[0]] = (
@@ -1449,98 +1451,6 @@ class AiterAttnBackend(AttentionBackend):
 
         else:
             raise ValueError(f"Invalid mode: {forward_mode=}")
-
-    def init_forward_metadata_replay_cuda_graph(
-        self,
-        bs: int,
-        req_pool_indices: torch.Tensor,
-        seq_lens: torch.Tensor,
-        seq_lens_sum: int,
-        encoder_lens: Optional[torch.Tensor],
-        forward_mode: ForwardMode,
-        spec_info: Optional[SpecInput],
-        seq_lens_cpu: Optional[torch.Tensor],
-    ):
-
-        if forward_mode.is_decode_or_idle():
-            kv_indptr = self.kv_indptr
-            kv_indices = self.cuda_graph_kv_indices
-            if spec_info is None:
-                kv_indptr[1 : bs + 1] = torch.cumsum(seq_lens[:bs], dim=0)
-                kv_indptr = kv_indptr[: bs + 1]
-                create_flashinfer_kv_indices_triton[(bs,)](
-                    self.req_to_token,
-                    req_pool_indices[:bs],
-                    seq_lens[:bs],
-                    kv_indptr,
-                    None,
-                    kv_indices,
-                    self.req_to_token.stride(0),
-                )
-            else:
-                kv_indptr[: spec_info.kv_indptr.shape[0]] = spec_info.kv_indptr
-                kv_indices[: spec_info.kv_indices.shape[0]] = spec_info.kv_indices
-
-        elif forward_mode.is_target_verify():
-            bs = len(req_pool_indices)
-            qo_indptr = self.qo_indptr[: bs + 1]
-            qo_indptr[: bs + 1] = torch.arange(
-                0,
-                (1 + bs) * self.num_draft_tokens,
-                step=self.num_draft_tokens,
-                dtype=torch.int32,
-                device=self.device,
-            )
-            if self.use_mla:
-                kv_lens = seq_lens + self.num_draft_tokens
-            else:
-                kv_lens = seq_lens
-            kv_indptr = self.kv_indptr[: bs + 1]
-            kv_indptr[1 : bs + 1] = torch.cumsum(kv_lens, dim=0)
-            kv_indices = self.cuda_graph_kv_indices
-            create_flashinfer_kv_indices_triton[(bs,)](
-                self.req_to_token,
-                req_pool_indices,
-                kv_lens,
-                kv_indptr,
-                None,
-                kv_indices,
-                self.req_to_token.stride(0),
-            )
-
-            # Non-MLA: update custom_mask and mask_indptr for extend_attention_fwd
-            if not self.use_mla:
-                custom_mask = self.cuda_graph_custom_mask
-                if spec_info is not None and spec_info.custom_mask is not None:
-                    custom_mask[: spec_info.custom_mask.shape[0]] = (
-                        spec_info.custom_mask
-                    )
-                seq_mask_len = self.num_draft_tokens * (
-                    seq_lens + self.num_draft_tokens
-                )
-                mask_indptr = self.mask_indptr[: bs + 1]
-                mask_indptr[1 : bs + 1] = torch.cumsum(seq_mask_len, dim=0)
-
-        elif forward_mode.is_draft_extend():
-            seq_lens = seq_lens[:bs]
-            accept_lens = spec_info.accept_length[:bs]
-            qo_indptr = self.qo_indptr[: bs + 1]
-            qo_indptr[1 : bs + 1] = torch.cumsum(accept_lens, dim=0)
-            kv_indptr = self.kv_indptr[: bs + 1]
-            kv_indptr[1 : bs + 1] = torch.cumsum(seq_lens, dim=0)
-            kv_indices = self.cuda_graph_kv_indices
-            create_flashinfer_kv_indices_triton[(bs,)](
-                self.req_to_token,
-                req_pool_indices,
-                seq_lens,
-                kv_indptr,
-                None,
-                kv_indices,
-                self.req_to_token.stride(0),
-            )
-
-        else:
-            raise ValueError("Invalid forward mode")
 
     def get_cuda_graph_seq_len_fill_value(self):
         return 1
