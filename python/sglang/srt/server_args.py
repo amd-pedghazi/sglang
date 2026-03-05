@@ -1352,9 +1352,23 @@ class ServerArgs:
         user_set_prefill = self.nsa_prefill_backend is not None
         user_set_decode = self.nsa_decode_backend is not None
 
-        if not user_set_prefill and not user_set_decode and is_hip():
-            self.nsa_prefill_backend = "tilelang"
-            self.nsa_decode_backend = "tilelang"
+        if is_hip():
+            # aiter MLA assembly kernels only support GQA ratios of 16 and 128.
+            # For models like GLM-5 (GQA=8), fall back to tilelang.
+            q_heads_per_gpu = (
+                self.get_model_config().num_attention_heads // self.tp_size
+            )
+            aiter_supported = q_heads_per_gpu % 16 == 0
+            hip_backend = "aiter" if aiter_supported else "tilelang"
+            if not aiter_supported:
+                logger.warning(
+                    f"aiter MLA kernel does not support GQA ratio {q_heads_per_gpu} "
+                    f"(requires multiple of 16). Using tilelang for NSA backends."
+                )
+            if not user_set_prefill:
+                self.nsa_prefill_backend = hip_backend
+            if not user_set_decode:
+                self.nsa_decode_backend = hip_backend
         elif kv_cache_dtype == "fp8_e4m3":
             if self.dp_size == 1 and major >= 10:
                 self.nsa_prefill_backend = "trtllm"
@@ -2111,9 +2125,10 @@ class ServerArgs:
             elif is_sm100_supported():
                 return "flashinfer"
             elif is_hip():
-                head_num = model_config.get_num_kv_heads(self.tp_size)
-                # TODO current aiter only support head number 16 or 128 head number
-                if head_num == 128 or head_num == 16:
+                q_heads = model_config.get_num_attention_heads(self.tp_size)
+                # aiter MLA kernel requires num_q_heads_per_gpu % 16 == 0
+                # (e.g. DS-V3 with TP=8 → 16 heads OK, GLM-5 with TP=8 → 8 heads NOT OK)
+                if q_heads % 16 == 0:
                     return "aiter"
                 else:
                     return "triton"

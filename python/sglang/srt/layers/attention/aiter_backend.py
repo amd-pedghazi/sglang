@@ -67,6 +67,8 @@ _use_fp8_prefill_attn = (
 fast_mode = False
 intra_batch_mode = True if _use_mla_ps_kernel else False
 
+_AITER_MLA_MIN_GQA = 16
+
 
 class WrapperDispatch(Enum):
     SLIDING_WINDOW = auto()
@@ -140,16 +142,22 @@ class AiterAttnBackend(AttentionBackend):
 
         # Get v_head_dim based on model type
         if self.use_mla:
-            # For MLA models, get v_head_dim from model config
             self.v_head_dim = model_runner.model_config.v_head_dim
+            self.qk_head_dim = (
+                model_runner.model_config.kv_lora_rank
+                + model_runner.model_config.qk_rope_head_dim
+            )
+            self._decode_v_head_dim = model_runner.model_config.kv_lora_rank
         elif hasattr(model_runner.token_to_kv_pool, "get_v_head_dim"):
             # For hybrid models (Mamba+attention, GDN, Kimi linear),
             # layer_id=0 may not be a full attention layer
             self.v_head_dim = model_runner.token_to_kv_pool.get_v_head_dim()
+            self._decode_v_head_dim = self.v_head_dim
         else:
             self.v_head_dim = model_runner.token_to_kv_pool.get_value_buffer(0).shape[
                 -1
             ]
+            self._decode_v_head_dim = self.v_head_dim
 
         # Parse constants
         self.max_context_len = model_runner.model_config.context_len
@@ -217,11 +225,16 @@ class AiterAttnBackend(AttentionBackend):
             )
             global _use_mla_ps_kernel, fast_mode, intra_batch_mode
 
+            self._need_head_pad = self.num_head < _AITER_MLA_MIN_GQA
+            self._padded_num_head = (
+                _AITER_MLA_MIN_GQA if self._need_head_pad else self.num_head
+            )
+
             # current mla_decode_fwd onln support fake-nps in self.num_head == 16
             # so all num_head size does not use qh16 kernel to simulate
             # it should not use fake-nps (fast_mode = False, intra_batch_mode = True)
             # it will cause gpu-fault or accuracy issue
-            if self.num_head == 32 or self.num_head == 128:
+            if self._padded_num_head == 32 or self._padded_num_head == 128:
                 fast_mode = True
                 intra_batch_mode = False
 
@@ -231,7 +244,7 @@ class AiterAttnBackend(AttentionBackend):
             # for non-fp8 kv_cache on tp8, use non-persist kernel to avoid performance degradation
             # head_num=16 (tp8 perf issue), head_num=128 (unsupported, like tp1 or --enable-dp-attention with tp8-dp8)
             if (
-                self.num_head == 16 or self.num_head == 128
+                self._padded_num_head == 16 or self._padded_num_head == 128
             ) and self.kv_cache_dtype is not fp8_dtype:
                 _use_mla_ps_kernel = False
                 fast_mode = False
@@ -244,8 +257,70 @@ class AiterAttnBackend(AttentionBackend):
 
             self.fix_max_split_per_batch = self.max_split_per_batch
 
+            # -- Pre-allocate reusable buffers for non-graph decode to avoid
+            #    per-call torch.empty / torch.zeros in the hot path. ----------
+
+            self._max_bs = max_bs
+
+            # kv_indices for non-graph decode (graph path uses cuda_graph_kv_indices)
+            self._kv_indices_buf = torch.empty(
+                max_bs * self.max_context_len,
+                dtype=torch.int32,
+                device=model_runner.device,
+            )
+
+            # Persistent-kernel metadata buffers (6 tensors) for non-graph decode
+            if _use_mla_ps_kernel:
+                max_seqlen_qo_decode = (
+                    1 if self.num_draft_tokens is None else self.num_draft_tokens
+                )
+                (
+                    self._ng_work_metadata,
+                    self._ng_work_indptr,
+                    self._ng_work_info_set,
+                    self._ng_reduce_indptr,
+                    self._ng_reduce_final_map,
+                    self._ng_reduce_partial_map,
+                ) = self.make_mla_decode_meta_data_buffer(
+                    max_seqlen_qo_decode, max_bs
+                )
+
+            # Decode output buffer: for MLA the absorbed decode outputs
+            # kv_lora_rank per head, which may differ from v_head_dim.
+            self._o_decode_buf = torch.empty(
+                max_bs, self.num_head * self._decode_v_head_dim,
+                dtype=self.input_dtype,
+                device=model_runner.device,
+            )
+
+            # Q/O head-padding buffers (decode-sized: max_bs tokens)
+            if self._need_head_pad:
+                q_pad_dim = self.qk_head_dim if self.use_mla else self.head_dim
+                self._q_pad_decode = torch.zeros(
+                    max_bs, _AITER_MLA_MIN_GQA, q_pad_dim,
+                    dtype=self.input_dtype,
+                    device=model_runner.device,
+                )
+                self._o_pad_decode = torch.zeros(
+                    max_bs, _AITER_MLA_MIN_GQA, self._decode_v_head_dim,
+                    dtype=self.input_dtype,
+                    device=model_runner.device,
+                )
+
+            # Scalar scale tensor reused across FP8 prefill calls
+            self._one_scale = torch.ones(
+                (), dtype=torch.float32, device=model_runner.device
+            )
+
+            # Pre-built arange for fp8_prefill_kv_indices (sequential 0..N-1)
+            self._arange_buf = torch.arange(
+                max_bs * self.max_context_len,
+                dtype=torch.int32,
+                device=model_runner.device,
+            )
+
     def make_mla_decode_meta_data_buffer(self, max_seqlen_qo, batch_size):
-        nhead = self.num_head
+        nhead = self._padded_num_head
         dtype = self.kv_cache_dtype
 
         if self.enable_dp_attention:
@@ -332,7 +407,7 @@ class AiterAttnBackend(AttentionBackend):
             qo_indptr,
             kv_indptr,
             kv_last_page_len,
-            self.num_head // nhead_kv,
+            self._padded_num_head // nhead_kv,
             nhead_kv,
             False,
             work_metadata,
@@ -629,14 +704,12 @@ class AiterAttnBackend(AttentionBackend):
                 max_q_len = 1
 
                 if _use_mla_ps_kernel:
-                    (
-                        work_metadata,
-                        work_indptr,
-                        work_info_set,
-                        reduce_indptr,
-                        reduce_final_map,
-                        reduce_partial_map,
-                    ) = self.make_mla_decode_meta_data_buffer(max_q_len, bs)
+                    work_metadata = self._ng_work_metadata
+                    work_indptr = self._ng_work_indptr
+                    work_info_set = self._ng_work_info_set
+                    reduce_indptr = self._ng_reduce_indptr
+                    reduce_final_map = self._ng_reduce_final_map
+                    reduce_partial_map = self._ng_reduce_partial_map
 
                     num_kv_splits = self.max_split_per_batch
 
@@ -1026,9 +1099,12 @@ class AiterAttnBackend(AttentionBackend):
                     )
 
                     total_s = forward_batch.seq_lens_sum
-                    fp8_prefill_kv_indices = torch.arange(
-                        total_s, device=self.device, dtype=torch.int32
-                    )
+                    if total_s <= self._arange_buf.shape[0]:
+                        fp8_prefill_kv_indices = self._arange_buf[:total_s]
+                    else:
+                        fp8_prefill_kv_indices = torch.arange(
+                            total_s, device=self.device, dtype=torch.int32
+                        )
 
                 self.forward_metadata = ForwardMetadata(
                     self.mla_indices_updater_prefill.kv_indptr,
@@ -1924,33 +2000,58 @@ class AiterAttnBackend(AttentionBackend):
                         )
 
                 else:
-                    if layer.qk_head_dim != layer.v_head_dim:
-                        o = q.new_empty(
-                            (q.shape[0], layer.tp_q_head_num * layer.v_head_dim)
+                    nhead = layer.tp_q_head_num
+                    need_pad = nhead < _AITER_MLA_MIN_GQA
+                    if need_pad:
+                        pad_nhead = _AITER_MLA_MIN_GQA
+                        tokens = q.shape[0]
+                        q_3d = q.view(tokens, nhead, layer.qk_head_dim)
+                        q_padded = torch.zeros(
+                            tokens, pad_nhead, layer.qk_head_dim,
+                            dtype=q.dtype, device=q.device,
+                        )
+                        q_padded[:, :nhead, :] = q_3d
+                        o_padded = torch.zeros(
+                            tokens, pad_nhead, layer.v_head_dim,
+                            dtype=q.dtype, device=q.device,
+                        )
+                        mla_prefill_fwd(
+                            q_padded,
+                            K_Buffer.view(-1, 1, 1, layer.qk_head_dim),
+                            o_padded,
+                            qo_indptr,
+                            kv_indptr,
+                            kv_indices,
+                            self.forward_metadata.kv_last_page_len,
+                            self.forward_metadata.max_q_len,
+                            layer.scaling,
+                            layer.logit_cap,
+                        )
+                        o = o_padded[:, :nhead, :].reshape(
+                            tokens, nhead * layer.v_head_dim
                         )
                     else:
-                        o = torch.empty_like(q)
-
-                    mla_prefill_fwd(
-                        q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
-                        K_Buffer.view(-1, 1, 1, layer.qk_head_dim),
-                        o.view(-1, layer.tp_q_head_num, layer.v_head_dim),
-                        qo_indptr,
-                        kv_indptr,
-                        kv_indices,
-                        self.forward_metadata.kv_last_page_len,
-                        self.forward_metadata.max_q_len,
-                        layer.scaling,
-                        layer.logit_cap,
-                    )
+                        if layer.qk_head_dim != layer.v_head_dim:
+                            o = q.new_empty(
+                                (q.shape[0], nhead * layer.v_head_dim)
+                            )
+                        else:
+                            o = torch.empty_like(q)
+                        mla_prefill_fwd(
+                            q.view(-1, nhead, layer.qk_head_dim),
+                            K_Buffer.view(-1, 1, 1, layer.qk_head_dim),
+                            o.view(-1, nhead, layer.v_head_dim),
+                            qo_indptr,
+                            kv_indptr,
+                            kv_indices,
+                            self.forward_metadata.kv_last_page_len,
+                            self.forward_metadata.max_q_len,
+                            layer.scaling,
+                            layer.logit_cap,
+                        )
                     K_Buffer = K_Buffer.view(-1, layer.tp_k_head_num, layer.qk_head_dim)
                     return o
             elif forward_batch.forward_mode.is_target_verify():
-                o = q.new_empty(
-                    (q.shape[0], layer.tp_q_head_num, layer.v_head_dim),
-                    dtype=self.input_dtype,
-                )
-
                 work_metadata = self.forward_metadata.work_metadata
                 work_indptr = self.forward_metadata.work_indptr
                 work_info_set = self.forward_metadata.work_info_set
@@ -1961,68 +2062,30 @@ class AiterAttnBackend(AttentionBackend):
 
                 num_kv_splits = self.forward_metadata.num_kv_splits
 
-                mla_decode_fwd(
-                    q,
-                    K_Buffer.view(-1, 1, 1, layer.qk_head_dim),
-                    o,
-                    self.forward_metadata.qo_indptr,
-                    self.forward_metadata.kv_indptr,
-                    self.forward_metadata.kv_indices,
-                    self.forward_metadata.kv_last_page_len,
-                    self.forward_metadata.max_q_len,
-                    sm_scale=layer.scaling,
-                    logit_cap=layer.logit_cap,
-                    work_meta_data=work_metadata,
-                    work_indptr=work_indptr,
-                    work_info_set=work_info_set,
-                    reduce_indptr=reduce_indptr,
-                    reduce_final_map=reduce_final_map,
-                    reduce_partial_map=reduce_partial_map,
-                    q_scale=(
-                        layer.k_scale if layer.k_scale is not None else self.k_scale
-                    ),
-                    kv_scale=(
-                        layer.k_scale if layer.k_scale is not None else self.k_scale
-                    ),
-                    intra_batch_mode=intra_batch_mode,
-                    num_kv_splits=num_kv_splits,
-                )
-                return o
-            elif (
-                forward_batch.forward_mode.is_draft_extend()
-                or forward_batch.forward_mode.is_draft_extend_v2()
-            ):
-
-                work_metadata = self.forward_metadata.work_metadata
-                work_indptr = self.forward_metadata.work_indptr
-                work_info_set = self.forward_metadata.work_info_set
-
-                reduce_indptr = self.forward_metadata.reduce_indptr
-                reduce_final_map = self.forward_metadata.reduce_final_map
-                reduce_partial_map = self.forward_metadata.reduce_partial_map
-
-                num_kv_splits = self.forward_metadata.num_kv_splits
-
-                if self.forward_metadata.run_graph is not True:
-
-                    bs, q_pad, q_mask = pad_sequence_with_mask(
-                        q.view(q.shape[0], -1),
-                        qo_indptr[:-1],
-                        forward_batch.extend_seq_lens,
-                        self.forward_metadata.max_q_len,
-                    )
-                    o = q.new_empty(
-                        (
-                            bs * self.forward_metadata.max_q_len,
-                            layer.tp_q_head_num,
-                            layer.v_head_dim,
-                        ),
-                        dtype=self.input_dtype,
-                    )
+                nhead = layer.tp_q_head_num
+                need_pad = nhead < _AITER_MLA_MIN_GQA
+                if need_pad:
+                    pad_nhead = _AITER_MLA_MIN_GQA
+                    tokens = q.shape[0]
+                    if tokens <= self._max_bs:
+                        q_padded = self._q_pad_decode[:tokens]
+                        q_padded.zero_()
+                        o_padded = self._o_pad_decode[:tokens]
+                        o_padded.zero_()
+                    else:
+                        q_padded = torch.zeros(
+                            tokens, pad_nhead, layer.qk_head_dim,
+                            dtype=q.dtype, device=q.device,
+                        )
+                        o_padded = torch.zeros(
+                            tokens, pad_nhead, layer.v_head_dim,
+                            dtype=self.input_dtype, device=q.device,
+                        )
+                    q_padded[:, :nhead, :] = q
                     mla_decode_fwd(
-                        q_pad.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
+                        q_padded,
                         K_Buffer.view(-1, 1, 1, layer.qk_head_dim),
-                        o,
+                        o_padded,
                         self.forward_metadata.qo_indptr,
                         self.forward_metadata.kv_indptr,
                         self.forward_metadata.kv_indices,
@@ -2045,15 +2108,12 @@ class AiterAttnBackend(AttentionBackend):
                         intra_batch_mode=intra_batch_mode,
                         num_kv_splits=num_kv_splits,
                     )
-
-                    total_valid_q = int(qo_indptr[-1].item())
-                    return o[:total_valid_q]
+                    o = o_padded[:, :nhead, :]
                 else:
                     o = q.new_empty(
-                        (q.shape[0], layer.tp_q_head_num, layer.v_head_dim),
+                        (q.shape[0], nhead, layer.v_head_dim),
                         dtype=self.input_dtype,
                     )
-
                     mla_decode_fwd(
                         q,
                         K_Buffer.view(-1, 1, 1, layer.qk_head_dim),
@@ -2080,6 +2140,171 @@ class AiterAttnBackend(AttentionBackend):
                         intra_batch_mode=intra_batch_mode,
                         num_kv_splits=num_kv_splits,
                     )
+                return o
+            elif (
+                forward_batch.forward_mode.is_draft_extend()
+                or forward_batch.forward_mode.is_draft_extend_v2()
+            ):
+
+                work_metadata = self.forward_metadata.work_metadata
+                work_indptr = self.forward_metadata.work_indptr
+                work_info_set = self.forward_metadata.work_info_set
+
+                reduce_indptr = self.forward_metadata.reduce_indptr
+                reduce_final_map = self.forward_metadata.reduce_final_map
+                reduce_partial_map = self.forward_metadata.reduce_partial_map
+
+                num_kv_splits = self.forward_metadata.num_kv_splits
+                nhead = layer.tp_q_head_num
+                need_pad = nhead < _AITER_MLA_MIN_GQA
+                pad_nhead = _AITER_MLA_MIN_GQA if need_pad else nhead
+
+                if self.forward_metadata.run_graph is not True:
+
+                    bs, q_pad, q_mask = pad_sequence_with_mask(
+                        q.view(q.shape[0], -1),
+                        qo_indptr[:-1],
+                        forward_batch.extend_seq_lens,
+                        self.forward_metadata.max_q_len,
+                    )
+                    total_pad_tokens = bs * self.forward_metadata.max_q_len
+                    if need_pad:
+                        q_3d = q_pad.view(-1, nhead, layer.qk_head_dim)
+                        if total_pad_tokens <= self._max_bs:
+                            q_padded = self._q_pad_decode[:total_pad_tokens]
+                            q_padded.zero_()
+                            o_padded = self._o_pad_decode[:total_pad_tokens]
+                            o_padded.zero_()
+                        else:
+                            q_padded = torch.zeros(
+                                q_3d.shape[0], pad_nhead, layer.qk_head_dim,
+                                dtype=q_pad.dtype, device=q_pad.device,
+                            )
+                            o_padded = torch.zeros(
+                                total_pad_tokens, pad_nhead, layer.v_head_dim,
+                                dtype=self.input_dtype, device=q.device,
+                            )
+                        q_padded[:, :nhead, :] = q_3d
+                        mla_decode_fwd(
+                            q_padded,
+                            K_Buffer.view(-1, 1, 1, layer.qk_head_dim),
+                            o_padded,
+                            self.forward_metadata.qo_indptr,
+                            self.forward_metadata.kv_indptr,
+                            self.forward_metadata.kv_indices,
+                            self.forward_metadata.kv_last_page_len,
+                            self.forward_metadata.max_q_len,
+                            sm_scale=layer.scaling,
+                            logit_cap=layer.logit_cap,
+                            work_meta_data=work_metadata,
+                            work_indptr=work_indptr,
+                            work_info_set=work_info_set,
+                            reduce_indptr=reduce_indptr,
+                            reduce_final_map=reduce_final_map,
+                            reduce_partial_map=reduce_partial_map,
+                            q_scale=layer.k_scale,
+                            kv_scale=layer.k_scale,
+                            intra_batch_mode=intra_batch_mode,
+                            num_kv_splits=num_kv_splits,
+                        )
+                        o = o_padded[:, :nhead, :]
+                    else:
+                        o = q.new_empty(
+                            (total_pad_tokens, nhead, layer.v_head_dim),
+                            dtype=self.input_dtype,
+                        )
+                        mla_decode_fwd(
+                            q_pad.view(-1, nhead, layer.qk_head_dim),
+                            K_Buffer.view(-1, 1, 1, layer.qk_head_dim),
+                            o,
+                            self.forward_metadata.qo_indptr,
+                            self.forward_metadata.kv_indptr,
+                            self.forward_metadata.kv_indices,
+                            self.forward_metadata.kv_last_page_len,
+                            self.forward_metadata.max_q_len,
+                            sm_scale=layer.scaling,
+                            logit_cap=layer.logit_cap,
+                            work_meta_data=work_metadata,
+                            work_indptr=work_indptr,
+                            work_info_set=work_info_set,
+                            reduce_indptr=reduce_indptr,
+                            reduce_final_map=reduce_final_map,
+                            reduce_partial_map=reduce_partial_map,
+                            q_scale=layer.k_scale,
+                            kv_scale=layer.k_scale,
+                            intra_batch_mode=intra_batch_mode,
+                            num_kv_splits=num_kv_splits,
+                        )
+
+                    return o[q_mask]
+                else:
+                    if need_pad:
+                        tokens = q.shape[0]
+                        if tokens <= self._max_bs:
+                            q_padded = self._q_pad_decode[:tokens]
+                            q_padded.zero_()
+                            o_padded = self._o_pad_decode[:tokens]
+                            o_padded.zero_()
+                        else:
+                            q_padded = torch.zeros(
+                                tokens, pad_nhead, layer.qk_head_dim,
+                                dtype=q.dtype, device=q.device,
+                            )
+                            o_padded = torch.zeros(
+                                tokens, pad_nhead, layer.v_head_dim,
+                                dtype=self.input_dtype, device=q.device,
+                            )
+                        q_padded[:, :nhead, :] = q
+                        mla_decode_fwd(
+                            q_padded,
+                            K_Buffer.view(-1, 1, 1, layer.qk_head_dim),
+                            o_padded,
+                            self.forward_metadata.qo_indptr,
+                            self.forward_metadata.kv_indptr,
+                            self.forward_metadata.kv_indices,
+                            self.forward_metadata.kv_last_page_len,
+                            self.forward_metadata.max_q_len,
+                            sm_scale=layer.scaling,
+                            logit_cap=layer.logit_cap,
+                            work_meta_data=work_metadata,
+                            work_indptr=work_indptr,
+                            work_info_set=work_info_set,
+                            reduce_indptr=reduce_indptr,
+                            reduce_final_map=reduce_final_map,
+                            reduce_partial_map=reduce_partial_map,
+                            q_scale=layer.k_scale,
+                            kv_scale=layer.k_scale,
+                            intra_batch_mode=intra_batch_mode,
+                            num_kv_splits=num_kv_splits,
+                        )
+                        o = o_padded[:, :nhead, :]
+                    else:
+                        o = q.new_empty(
+                            (q.shape[0], nhead, layer.v_head_dim),
+                            dtype=self.input_dtype,
+                        )
+                        mla_decode_fwd(
+                            q,
+                            K_Buffer.view(-1, 1, 1, layer.qk_head_dim),
+                            o,
+                            self.forward_metadata.qo_indptr,
+                            self.forward_metadata.kv_indptr,
+                            self.forward_metadata.kv_indices,
+                            self.forward_metadata.kv_last_page_len,
+                            self.forward_metadata.max_q_len,
+                            sm_scale=layer.scaling,
+                            logit_cap=layer.logit_cap,
+                            work_meta_data=work_metadata,
+                            work_indptr=work_indptr,
+                            work_info_set=work_info_set,
+                            reduce_indptr=reduce_indptr,
+                            reduce_final_map=reduce_final_map,
+                            reduce_partial_map=reduce_partial_map,
+                            q_scale=layer.k_scale,
+                            kv_scale=layer.k_scale,
+                            intra_batch_mode=intra_batch_mode,
+                            num_kv_splits=num_kv_splits,
+                        )
                     return o
             else:
                 raise ValueError(
@@ -2166,10 +2391,13 @@ class AiterAttnBackend(AttentionBackend):
     ):
 
         q = q.reshape(-1, layer.tp_q_head_num * layer.qk_head_dim)
+        tokens = q.shape[0]
 
-        if layer.qk_head_dim != layer.v_head_dim:
+        if tokens <= self._max_bs:
+            o = self._o_decode_buf[:tokens]
+        elif layer.qk_head_dim != layer.v_head_dim:
             o = q.new_empty(
-                (q.shape[0], layer.tp_q_head_num * layer.v_head_dim),
+                (tokens, layer.tp_q_head_num * layer.v_head_dim),
                 dtype=self.input_dtype,
             )
         else:
@@ -2194,28 +2422,71 @@ class AiterAttnBackend(AttentionBackend):
 
             num_kv_splits = self.forward_metadata.num_kv_splits
 
-            mla_decode_fwd(
-                q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
-                k_buffer.view(-1, 1, 1, layer.qk_head_dim),
-                o.view(-1, layer.tp_q_head_num, layer.v_head_dim),
-                self.forward_metadata.qo_indptr,
-                self.forward_metadata.kv_indptr,
-                self.forward_metadata.kv_indices,
-                self.forward_metadata.kv_last_page_len,
-                self.forward_metadata.max_q_len,
-                sm_scale=layer.scaling,
-                logit_cap=layer.logit_cap,
-                work_meta_data=work_metadata,
-                work_indptr=work_indptr,
-                work_info_set=work_info_set,
-                reduce_indptr=reduce_indptr,
-                reduce_final_map=reduce_final_map,
-                reduce_partial_map=reduce_partial_map,
-                q_scale=layer.k_scale if layer.k_scale is not None else self.k_scale,
-                kv_scale=layer.k_scale if layer.k_scale is not None else self.k_scale,
-                intra_batch_mode=intra_batch_mode,
-                num_kv_splits=num_kv_splits,
-            )
+            nhead = layer.tp_q_head_num
+            need_pad = nhead < _AITER_MLA_MIN_GQA
+            if need_pad:
+                pad_nhead = _AITER_MLA_MIN_GQA
+                if tokens <= self._max_bs:
+                    q_padded = self._q_pad_decode[:tokens]
+                    q_padded.zero_()
+                    o_padded = self._o_pad_decode[:tokens]
+                    o_padded.zero_()
+                else:
+                    q_padded = torch.zeros(
+                        tokens, pad_nhead, layer.qk_head_dim,
+                        dtype=q.dtype, device=q.device,
+                    )
+                    o_padded = torch.zeros(
+                        tokens, pad_nhead, layer.v_head_dim,
+                        dtype=self.input_dtype, device=q.device,
+                    )
+                q_padded[:, :nhead, :] = q.view(tokens, nhead, layer.qk_head_dim)
+                mla_decode_fwd(
+                    q_padded,
+                    k_buffer.view(-1, 1, 1, layer.qk_head_dim),
+                    o_padded,
+                    self.forward_metadata.qo_indptr,
+                    self.forward_metadata.kv_indptr,
+                    self.forward_metadata.kv_indices,
+                    self.forward_metadata.kv_last_page_len,
+                    self.forward_metadata.max_q_len,
+                    sm_scale=layer.scaling,
+                    logit_cap=layer.logit_cap,
+                    work_meta_data=work_metadata,
+                    work_indptr=work_indptr,
+                    work_info_set=work_info_set,
+                    reduce_indptr=reduce_indptr,
+                    reduce_final_map=reduce_final_map,
+                    reduce_partial_map=reduce_partial_map,
+                    q_scale=layer.k_scale if layer.k_scale is not None else self.k_scale,
+                    kv_scale=layer.k_scale if layer.k_scale is not None else self.k_scale,
+                    intra_batch_mode=intra_batch_mode,
+                    num_kv_splits=num_kv_splits,
+                )
+                o = o_padded[:, :nhead, :].reshape(tokens, nhead * layer.v_head_dim)
+            else:
+                mla_decode_fwd(
+                    q.view(-1, nhead, layer.qk_head_dim),
+                    k_buffer.view(-1, 1, 1, layer.qk_head_dim),
+                    o.view(-1, nhead, layer.v_head_dim),
+                    self.forward_metadata.qo_indptr,
+                    self.forward_metadata.kv_indptr,
+                    self.forward_metadata.kv_indices,
+                    self.forward_metadata.kv_last_page_len,
+                    self.forward_metadata.max_q_len,
+                    sm_scale=layer.scaling,
+                    logit_cap=layer.logit_cap,
+                    work_meta_data=work_metadata,
+                    work_indptr=work_indptr,
+                    work_info_set=work_info_set,
+                    reduce_indptr=reduce_indptr,
+                    reduce_final_map=reduce_final_map,
+                    reduce_partial_map=reduce_partial_map,
+                    q_scale=layer.k_scale if layer.k_scale is not None else self.k_scale,
+                    kv_scale=layer.k_scale if layer.k_scale is not None else self.k_scale,
+                    intra_batch_mode=intra_batch_mode,
+                    num_kv_splits=num_kv_splits,
+                )
         else:
             self.logits_soft_cap = layer.logit_cap
 
