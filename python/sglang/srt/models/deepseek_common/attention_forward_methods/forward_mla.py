@@ -262,9 +262,13 @@ class DeepseekMLAForwardMixin:
                     )
 
                 else:
+                    # Cache the BF16-converted weight to avoid repeated
+                    # .to(bf16) and scale multiply every call
+                    if not hasattr(self, "_w_kc_bf16"):
+                        self._w_kc_bf16 = self.w_kc.to(torch.bfloat16) * self.w_scale
                     q_nope_out = torch.bmm(
                         q_nope.to(torch.bfloat16).transpose(0, 1),
-                        self.w_kc.to(torch.bfloat16) * self.w_scale,
+                        self._w_kc_bf16,
                     )
 
         elif self.w_kc.dtype == torch.float8_e4m3fn:
@@ -438,9 +442,13 @@ class DeepseekMLAForwardMixin:
                         dtype=torch.bfloat16,
                     )
                 else:
+                    # Cache the BF16-converted weight to avoid repeated
+                    # .to(bf16) and scale multiply every call
+                    if not hasattr(self, "_w_vc_bf16"):
+                        self._w_vc_bf16 = self.w_vc.to(torch.bfloat16) * self.w_scale
                     attn_bmm_output = torch.bmm(
                         attn_output.to(torch.bfloat16).transpose(0, 1),
-                        self.w_vc.to(torch.bfloat16) * self.w_scale,
+                        self._w_vc_bf16,
                     )
 
             if self.o_proj.weight.dtype == torch.uint8:
