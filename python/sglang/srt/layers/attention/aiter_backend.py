@@ -1911,7 +1911,7 @@ class AiterAttnBackend(AttentionBackend):
             ):
                 extend_no_prefix = not any(forward_batch.extend_prefix_lens_cpu)
                 if kv_indices.shape[0] == 0 or extend_no_prefix:
-                    if _use_fp8_prefill_attn:
+                    if _use_fp8_prefill_attn and not self._need_head_pad:
                         output = self.mla_fp8_prefill_attn(
                             q,
                             k,
