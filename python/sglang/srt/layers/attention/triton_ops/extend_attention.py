@@ -61,8 +61,18 @@ def _get_block_sizes_for_extend_attention(Lq: int, Lv: int):
 
     # Determine BLOCK_M, BLOCK_N, and num_warps based on hardware
     if _is_hip:
-        BLOCK_M, BLOCK_N = (64, 64)
-        num_warps = 4
+        # MI300X/MI300A: 64KB LDS per CU, wavefront=64.
+        # Larger BLOCK_N improves KV throughput for long-sequence workloads
+        # (e.g. speculative decoding verification with small Q, large KV).
+        if Lq <= 128:
+            BLOCK_M, BLOCK_N = (64, 128)
+            num_warps = 4
+        elif Lq <= 256:
+            BLOCK_M, BLOCK_N = (64, 64)
+            num_warps = 4
+        else:
+            BLOCK_M, BLOCK_N = (32, 64)
+            num_warps = 4
     else:
         if _is_cuda and CUDA_CAPABILITY[0] == 12:
             # sm120 workstation Blackwell architecture (RTX Pro 6000) has a much smaller shared memory size (100K)
@@ -1059,5 +1069,553 @@ def extend_attention_fwd_unified(
         HAS_SINK=HAS_SINK,
         num_warps=num_warps,
         num_stages=num_stages,
+        **extra_kargs,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Split-KV kernels for speculative-decoding verification
+# ---------------------------------------------------------------------------
+# During TARGET_VERIFY the query length is tiny (draft_num ≈ 3-8) but the
+# prefix KV can be very long (70 K+).  The original _fwd_kernel assigns one
+# thread-block per (batch, head) that serially loops over the whole prefix.
+#
+# The split-KV approach parallelises that loop across *num_kv_splits* workers.
+# Each worker computes a partial (output, lse) for its KV chunk.  A lightweight
+# reduce kernel merges the partials and also handles the tiny Stage-2 extend
+# attention (custom / tree mask) in one pass.
+# ---------------------------------------------------------------------------
+
+
+@triton.jit
+def _fwd_kernel_splitkv(
+    Q_Extend,
+    K_Buffer,
+    V_Buffer,
+    Out_Partial,  # [batch, head, num_kv_splits, BLOCK_M, BLOCK_DV]
+    LSE_Partial,  # [batch, head, num_kv_splits, BLOCK_M]
+    qo_indptr,
+    kv_indptr,
+    kv_indices,
+    sm_scale,
+    k_scale,
+    v_scale,
+    kv_group_num,
+    stride_qbs,
+    stride_qh,
+    stride_buf_kbs,
+    stride_buf_kh,
+    stride_buf_vbs,
+    stride_buf_vh,
+    stride_op_b,
+    stride_op_h,
+    stride_op_s,
+    stride_op_m,
+    stride_lse_b,
+    stride_lse_h,
+    stride_lse_s,
+    logit_cap: tl.constexpr,
+    Lq: tl.constexpr,
+    Lv: tl.constexpr,
+    BLOCK_DMODEL: tl.constexpr,
+    BLOCK_DPE: tl.constexpr,
+    BLOCK_DV: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    NUM_KV_SPLITS: tl.constexpr,
+    STORE_TRANSPOSE: tl.constexpr,
+):
+    cur_seq = tl.program_id(0)
+    cur_head = tl.program_id(1)
+    cur_split = tl.program_id(2)
+    cur_kv_head = cur_head // kv_group_num
+
+    cur_seq_extend_start_idx = tl.load(qo_indptr + cur_seq)
+    cur_seq_len_extend = tl.load(qo_indptr + cur_seq + 1) - cur_seq_extend_start_idx
+    cur_seq_kv_start_idx = tl.load(kv_indptr + cur_seq)
+    cur_seq_len_prefix = tl.load(kv_indptr + cur_seq + 1) - cur_seq_kv_start_idx
+
+    chunk_size = tl.cdiv(cur_seq_len_prefix, NUM_KV_SPLITS)
+    split_kv_start = cur_split * chunk_size
+    split_kv_end = tl.minimum(split_kv_start + chunk_size, cur_seq_len_prefix)
+
+    offs_d = tl.arange(0, BLOCK_DMODEL)
+    offs_dv = tl.arange(0, BLOCK_DV)
+    offs_m = tl.arange(0, BLOCK_M)
+    offs_n = tl.arange(0, BLOCK_N)
+
+    mask_m = offs_m < cur_seq_len_extend
+    mask_d = offs_d < Lq
+    mask_dv = offs_dv < Lv
+
+    offs_q = (
+        (cur_seq_extend_start_idx + offs_m[:, None]) * stride_qbs
+        + cur_head * stride_qh
+        + offs_d[None, :]
+    )
+    q = tl.load(Q_Extend + offs_q, mask=mask_m[:, None] & mask_d[None, :], other=0.0)
+
+    if BLOCK_DPE > 0:
+        offs_dpe = BLOCK_DMODEL + tl.arange(0, BLOCK_DPE)
+        offs_qpe = (
+            (cur_seq_extend_start_idx + offs_m[:, None]) * stride_qbs
+            + cur_head * stride_qh
+            + offs_dpe[None, :]
+        )
+        qpe = tl.load(Q_Extend + offs_qpe, mask=mask_m[:, None], other=0.0)
+
+    acc = tl.zeros([BLOCK_M, BLOCK_DV], dtype=tl.float32)
+    deno = tl.zeros([BLOCK_M], dtype=tl.float32)
+    e_max = tl.zeros([BLOCK_M], dtype=tl.float32) - float("inf")
+
+    for start_n in range(split_kv_start, split_kv_end, BLOCK_N):
+        start_n = tl.multiple_of(start_n, BLOCK_N)
+        mask_n = (start_n + offs_n) < split_kv_end
+
+        offs_kv_loc = tl.load(
+            kv_indices + cur_seq_kv_start_idx + start_n + offs_n,
+            mask=mask_n,
+            other=0,
+        )
+
+        offs_buf_k = (
+            offs_kv_loc[None, :] * stride_buf_kbs
+            + cur_kv_head * stride_buf_kh
+            + offs_d[:, None]
+        )
+        k = tl.load(
+            K_Buffer + offs_buf_k,
+            mask=mask_n[None, :] & mask_d[:, None],
+            other=0.0,
+        )
+
+        qk = tl.dot(q.to(k.dtype), k)
+        if BLOCK_DPE > 0:
+            offs_kpe = (
+                offs_kv_loc[None, :] * stride_buf_kbs
+                + cur_kv_head * stride_buf_kh
+                + offs_dpe[:, None]
+            )
+            kpe = tl.load(K_Buffer + offs_kpe, mask=mask_n[None, :], other=0.0)
+            qk += tl.dot(qpe.to(kpe.dtype), kpe)
+        qk *= sm_scale * k_scale
+
+        if logit_cap > 0:
+            qk = logit_cap * tanh(qk / logit_cap)
+
+        final_mask = mask_m[:, None] & mask_n[None, :]
+        qk = tl.where(final_mask, qk, float("-inf"))
+
+        row_max = tl.max(qk, 1)
+        row_max_fixed = tl.where(row_max == float("-inf"), -1e20, row_max)
+        n_e_max = tl.maximum(row_max_fixed, e_max)
+
+        re_scale = tl.exp(e_max - n_e_max)
+        p = tl.exp(qk - n_e_max[:, None])
+        deno = deno * re_scale + tl.sum(p, 1)
+
+        offs_buf_v = (
+            offs_kv_loc[:, None] * stride_buf_vbs
+            + cur_kv_head * stride_buf_vh
+            + offs_dv[None, :]
+        )
+        v = tl.load(
+            V_Buffer + offs_buf_v,
+            mask=mask_n[:, None] & mask_dv[None, :],
+            other=0.0,
+        )
+        p = p.to(v.dtype)
+        acc = acc * re_scale[:, None] + tl.dot(p, v) * v_scale
+
+        e_max = n_e_max
+
+    lse = e_max + tl.log(tl.maximum(deno, 1e-20))
+
+    # Write partial output and LSE
+    offs_op = (
+        cur_seq * stride_op_b
+        + cur_head * stride_op_h
+        + cur_split * stride_op_s
+        + offs_m[:, None] * stride_op_m
+        + offs_dv[None, :]
+    )
+    safe_deno = tl.where(deno > 0, deno, 1.0)
+    partial_o = acc / safe_deno[:, None]
+    tl.store(Out_Partial + offs_op, partial_o, mask=mask_m[:, None] & mask_dv[None, :])
+
+    offs_lse = (
+        cur_seq * stride_lse_b
+        + cur_head * stride_lse_h
+        + cur_split * stride_lse_s
+        + offs_m
+    )
+    tl.store(LSE_Partial + offs_lse, lse, mask=mask_m)
+
+
+@triton.jit
+def _reduce_splitkv_kernel(
+    Out_Partial,  # [batch, head, num_kv_splits, BLOCK_M, BLOCK_DV]
+    LSE_Partial,  # [batch, head, num_kv_splits, BLOCK_M]
+    K_Extend,
+    V_Extend,
+    O_Extend,
+    qo_indptr,
+    kv_indptr,
+    mask_ptr,
+    mask_indptr,
+    Q_Extend,
+    sm_scale,
+    kv_group_num,
+    stride_qbs,
+    stride_qh,
+    stride_kbs,
+    stride_kh,
+    stride_vbs,
+    stride_vh,
+    stride_obs,
+    stride_oh,
+    stride_op_b,
+    stride_op_h,
+    stride_op_s,
+    stride_op_m,
+    stride_lse_b,
+    stride_lse_h,
+    stride_lse_s,
+    logit_cap: tl.constexpr,
+    Lq: tl.constexpr,
+    Lv: tl.constexpr,
+    BLOCK_DMODEL: tl.constexpr,
+    BLOCK_DPE: tl.constexpr,
+    BLOCK_DV: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    NUM_KV_SPLITS: tl.constexpr,
+    USE_CUSTOM_MASK: tl.constexpr,
+    IS_CAUSAL: tl.constexpr,
+    STORE_TRANSPOSE: tl.constexpr,
+):
+    cur_seq = tl.program_id(0)
+    cur_head = tl.program_id(1)
+    cur_kv_head = cur_head // kv_group_num
+
+    cur_seq_extend_start_idx = tl.load(qo_indptr + cur_seq)
+    cur_seq_len_extend = tl.load(qo_indptr + cur_seq + 1) - cur_seq_extend_start_idx
+    cur_seq_kv_start_idx = tl.load(kv_indptr + cur_seq)
+    cur_seq_len_prefix = tl.load(kv_indptr + cur_seq + 1) - cur_seq_kv_start_idx
+    cur_seq_len = cur_seq_len_prefix + cur_seq_len_extend
+
+    offs_m = tl.arange(0, BLOCK_M)
+    offs_dv = tl.arange(0, BLOCK_DV)
+    mask_m = offs_m < cur_seq_len_extend
+    mask_dv = offs_dv < Lv
+
+    # --- Merge prefix partials across splits ---
+    merged_o = tl.zeros([BLOCK_M, BLOCK_DV], dtype=tl.float32)
+    merged_deno = tl.zeros([BLOCK_M], dtype=tl.float32)
+    merged_max = tl.zeros([BLOCK_M], dtype=tl.float32) - float("inf")
+
+    for s in range(NUM_KV_SPLITS):
+        offs_lse = (
+            cur_seq * stride_lse_b
+            + cur_head * stride_lse_h
+            + s * stride_lse_s
+            + offs_m
+        )
+        lse_s = tl.load(LSE_Partial + offs_lse, mask=mask_m, other=float("-inf"))
+
+        offs_op = (
+            cur_seq * stride_op_b
+            + cur_head * stride_op_h
+            + s * stride_op_s
+            + offs_m[:, None] * stride_op_m
+            + offs_dv[None, :]
+        )
+        o_s = tl.load(
+            Out_Partial + offs_op, mask=mask_m[:, None] & mask_dv[None, :], other=0.0
+        )
+
+        n_max = tl.maximum(merged_max, lse_s)
+        old_scale = tl.exp(merged_max - n_max)
+        new_scale = tl.exp(lse_s - n_max)
+
+        merged_o = merged_o * old_scale[:, None] + o_s * new_scale[:, None]
+        merged_deno = merged_deno * old_scale + new_scale
+        merged_max = n_max
+
+    # --- Stage 2: extend (draft token) attention with custom / causal mask ---
+    offs_d = tl.arange(0, BLOCK_DMODEL)
+    offs_n = tl.arange(0, BLOCK_N)
+    mask_d = offs_d < Lq
+
+    if USE_CUSTOM_MASK:
+        cur_seq_mask_start_idx = tl.load(mask_indptr + cur_seq)
+
+    offs_q = (
+        (cur_seq_extend_start_idx + offs_m[:, None]) * stride_qbs
+        + cur_head * stride_qh
+        + offs_d[None, :]
+    )
+    q = tl.load(Q_Extend + offs_q, mask=mask_m[:, None] & mask_d[None, :], other=0.0)
+
+    if BLOCK_DPE > 0:
+        offs_dpe = BLOCK_DMODEL + tl.arange(0, BLOCK_DPE)
+        offs_qpe = (
+            (cur_seq_extend_start_idx + offs_m[:, None]) * stride_qbs
+            + cur_head * stride_qh
+            + offs_dpe[None, :]
+        )
+        qpe = tl.load(Q_Extend + offs_qpe, mask=mask_m[:, None], other=0.0)
+
+    cur_block_m_end = (
+        cur_seq_len_extend if not IS_CAUSAL else cur_seq_len_extend
+    )
+    for start_n in range(0, cur_block_m_end, BLOCK_N):
+        start_n = tl.multiple_of(start_n, BLOCK_N)
+        mask_n = (start_n + offs_n) < cur_block_m_end
+
+        final_mask = mask_m[:, None] & mask_n[None, :]
+        if USE_CUSTOM_MASK:
+            custom_mask = tl.load(
+                mask_ptr
+                + cur_seq_mask_start_idx
+                + offs_m[:, None] * (cur_seq_len)
+                + cur_seq_len_prefix
+                + start_n
+                + offs_n[None, :],
+                mask=mask_m[:, None] & mask_n[None, :],
+                other=0,
+            )
+            custom_mask &= mask_m[:, None] & mask_n[None, :]
+            final_mask &= custom_mask
+        elif IS_CAUSAL:
+            mask_causal = offs_m[:, None] >= (start_n + offs_n[None, :])
+            mask_causal &= mask_m[:, None] & mask_n[None, :]
+            final_mask &= mask_causal
+
+        SKIP_TILE = False
+        if USE_CUSTOM_MASK:
+            SKIP_TILE = tl.max(tl.max(final_mask.to(tl.int32), axis=1), axis=0) == 0
+
+        if not SKIP_TILE:
+            offs_k = (
+                (cur_seq_extend_start_idx + start_n + offs_n[None, :]) * stride_kbs
+                + cur_kv_head * stride_kh
+                + offs_d[:, None]
+            )
+            k = tl.load(
+                K_Extend + offs_k,
+                mask=mask_n[None, :] & mask_d[:, None],
+                other=0.0,
+            )
+
+            qk = tl.dot(q, k, out_dtype=tl.float32)
+            if BLOCK_DPE > 0:
+                offs_kpe = (
+                    (cur_seq_extend_start_idx + start_n + offs_n[None, :]) * stride_kbs
+                    + cur_kv_head * stride_kh
+                    + offs_dpe[:, None]
+                )
+                kpe = tl.load(K_Extend + offs_kpe, mask=mask_n[None, :], other=0.0)
+                qk += tl.dot(qpe, kpe)
+            qk *= sm_scale
+
+            if logit_cap > 0:
+                qk = logit_cap * tanh(qk / logit_cap)
+
+            qk = tl.where(final_mask, qk, float("-inf"))
+
+            row_max = tl.max(qk, 1)
+            row_max_fixed = tl.where(row_max == float("-inf"), -1e20, row_max)
+            ext_lse = row_max_fixed + tl.log(
+                tl.maximum(tl.sum(tl.exp(qk - row_max_fixed[:, None]), 1), 1e-20)
+            )
+
+            n_max = tl.maximum(merged_max, ext_lse)
+            old_scale = tl.exp(merged_max - n_max)
+            new_scale_raw = tl.exp(ext_lse - n_max)
+
+            p = tl.exp(qk - n_max[:, None])
+            offs_v = (
+                (cur_seq_extend_start_idx + start_n + offs_n[:, None]) * stride_vbs
+                + cur_kv_head * stride_vh
+                + offs_dv[None, :]
+            )
+            v = tl.load(
+                V_Extend + offs_v,
+                mask=mask_n[:, None] & mask_dv[None, :],
+                other=0.0,
+            )
+            ext_o = tl.dot(p.to(v.dtype), v)
+
+            merged_o = merged_o * old_scale[:, None] + ext_o
+            merged_deno = merged_deno * old_scale + new_scale_raw
+            merged_max = n_max
+
+    safe_deno = tl.where(merged_deno > 0, merged_deno, 1.0)
+    final_o = merged_o / safe_deno[:, None]
+
+    offs_o = (
+        (cur_seq_extend_start_idx + offs_m[:, None]) * stride_obs
+        + cur_head * stride_oh
+        + offs_dv[None, :]
+    )
+    if STORE_TRANSPOSE:
+        tl.store(
+            O_Extend + offs_o.T,
+            final_o.T,
+            mask=(mask_m[:, None] & mask_dv[None, :]).T,
+        )
+    else:
+        tl.store(
+            O_Extend + offs_o,
+            final_o,
+            mask=mask_m[:, None] & mask_dv[None, :],
+        )
+
+
+def extend_attention_fwd_splitkv(
+    q_extend,
+    k_extend,
+    v_extend,
+    o_extend,
+    k_buffer,
+    v_buffer,
+    qo_indptr,
+    kv_indptr,
+    kv_indices,
+    custom_mask,
+    is_causal,
+    mask_indptr,
+    max_len_extend,
+    k_scale,
+    v_scale,
+    sm_scale=None,
+    logit_cap=0.0,
+    num_kv_splits=32,
+    out_partial=None,
+    lse_partial=None,
+):
+    Lq = q_extend.shape[-1]
+    Lv = v_extend.shape[-1]
+
+    BLOCK_DMODEL, BLOCK_DPE, BLOCK_DV, BLOCK_M, BLOCK_N, num_warps = (
+        _get_block_sizes_for_extend_attention(Lq, Lv)
+    )
+
+    sm_scale = sm_scale or 1.0 / (Lq**0.5)
+    batch_size = qo_indptr.shape[0] - 1
+    head_num = q_extend.shape[1]
+    kv_group_num = q_extend.shape[1] // k_extend.shape[1]
+
+    USE_CUSTOM_MASK = custom_mask is not None
+
+    extra_kargs = {}
+    if _is_hip:
+        extra_kargs = {"waves_per_eu": 1, "matrix_instr_nonkdim": 16, "kpack": 2}
+
+    # Allocate intermediate buffers (reuse if pre-allocated for CUDA graph)
+    if out_partial is None:
+        out_partial = torch.zeros(
+            (batch_size, head_num, num_kv_splits, BLOCK_M, BLOCK_DV),
+            dtype=torch.float32,
+            device=q_extend.device,
+        )
+    if lse_partial is None:
+        lse_partial = torch.full(
+            (batch_size, head_num, num_kv_splits, BLOCK_M),
+            float("-inf"),
+            dtype=torch.float32,
+            device=q_extend.device,
+        )
+    else:
+        lse_partial.fill_(float("-inf"))
+
+    # Phase 1: split-KV kernel — parallelize prefix across splits
+    grid_split = (batch_size, head_num, num_kv_splits)
+    _fwd_kernel_splitkv[grid_split](
+        q_extend,
+        k_buffer,
+        v_buffer,
+        out_partial,
+        lse_partial,
+        qo_indptr,
+        kv_indptr,
+        kv_indices,
+        sm_scale,
+        k_scale,
+        v_scale,
+        kv_group_num,
+        q_extend.stride(0),
+        q_extend.stride(1),
+        k_buffer.stride(0),
+        k_buffer.stride(1),
+        v_buffer.stride(0),
+        v_buffer.stride(1),
+        out_partial.stride(0),
+        out_partial.stride(1),
+        out_partial.stride(2),
+        out_partial.stride(3),
+        lse_partial.stride(0),
+        lse_partial.stride(1),
+        lse_partial.stride(2),
+        logit_cap=logit_cap,
+        Lq=Lq,
+        Lv=Lv,
+        BLOCK_DMODEL=BLOCK_DMODEL,
+        BLOCK_DPE=BLOCK_DPE,
+        BLOCK_DV=BLOCK_DV,
+        BLOCK_M=BLOCK_M,
+        BLOCK_N=BLOCK_N,
+        NUM_KV_SPLITS=num_kv_splits,
+        STORE_TRANSPOSE=_is_hip,
+        num_warps=num_warps,
+        num_stages=1,
+        **extra_kargs,
+    )
+
+    # Phase 2: reduce kernel — merge partials + Stage 2 extend attention
+    grid_reduce = (batch_size, head_num)
+    _reduce_splitkv_kernel[grid_reduce](
+        out_partial,
+        lse_partial,
+        k_extend,
+        v_extend,
+        o_extend,
+        qo_indptr,
+        kv_indptr,
+        custom_mask,
+        mask_indptr,
+        q_extend,
+        sm_scale,
+        kv_group_num,
+        q_extend.stride(0),
+        q_extend.stride(1),
+        k_extend.stride(0),
+        k_extend.stride(1),
+        v_extend.stride(0),
+        v_extend.stride(1),
+        o_extend.stride(0),
+        o_extend.stride(1),
+        out_partial.stride(0),
+        out_partial.stride(1),
+        out_partial.stride(2),
+        out_partial.stride(3),
+        lse_partial.stride(0),
+        lse_partial.stride(1),
+        lse_partial.stride(2),
+        logit_cap=logit_cap,
+        Lq=Lq,
+        Lv=Lv,
+        BLOCK_DMODEL=BLOCK_DMODEL,
+        BLOCK_DPE=BLOCK_DPE,
+        BLOCK_DV=BLOCK_DV,
+        BLOCK_M=BLOCK_M,
+        BLOCK_N=BLOCK_N,
+        NUM_KV_SPLITS=num_kv_splits,
+        USE_CUSTOM_MASK=USE_CUSTOM_MASK,
+        IS_CAUSAL=is_causal,
+        STORE_TRANSPOSE=_is_hip,
+        num_warps=num_warps,
+        num_stages=1,
         **extra_kargs,
     )

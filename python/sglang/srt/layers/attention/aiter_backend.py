@@ -126,6 +126,7 @@ class AiterAttnBackend(AttentionBackend):
         # Lazy import to avoid the initialization of cuda context
         from sglang.srt.layers.attention.triton_ops.extend_attention import (
             extend_attention_fwd,
+            extend_attention_fwd_splitkv,
         )
 
         self.input_dtype = model_runner.model_config.dtype
@@ -133,6 +134,9 @@ class AiterAttnBackend(AttentionBackend):
         self.page_size = model_runner.server_args.page_size
 
         self.extend_attention_fwd = torch.compiler.disable(extend_attention_fwd)
+        self.extend_attention_fwd_splitkv = torch.compiler.disable(
+            extend_attention_fwd_splitkv
+        )
 
         self.device = model_runner.device
         self.is_multimodal = model_runner.model_config.is_multimodal
@@ -170,12 +174,18 @@ class AiterAttnBackend(AttentionBackend):
             and self.num_draft_tokens is not None
             and self.num_draft_tokens > 0
         ):
-            logger.warning(
+            logger.info(
                 "Aiter backend: Non-MLA model with speculative decoding detected. "
-                "Using triton extend_attention_fwd kernel for speculative decoding "
-                "attention (TARGET_VERIFY/DRAFT_EXTEND) as mha_batch_prefill_func "
-                "does not support custom tree masks required for speculative decoding."
+                "Using split-KV triton kernel for TARGET_VERIFY to parallelise "
+                "long-prefix attention across multiple GPU workers."
             )
+
+        # Split-KV configuration for speculative decoding verification.
+        # Intermediate buffers are lazily allocated on first use or in
+        # init_cuda_graph_state for CUDA graph paths.
+        self.num_kv_splits = 16
+        self.splitkv_out_partial = None
+        self.splitkv_lse_partial = None
 
         # Parse constants
         self.max_context_len = model_runner.model_config.context_len
@@ -1143,6 +1153,28 @@ class AiterAttnBackend(AttentionBackend):
             self.reduce_final_map = None
             self.reduce_partial_map = None
 
+        # Pre-allocate split-KV intermediate buffers for CUDA graph capture.
+        # BLOCK_M is determined by head_dim; for typical non-MLA models
+        # (head_dim ≤ 128) _get_block_sizes returns BLOCK_M=64.
+        from sglang.srt.layers.attention.triton_ops.extend_attention import (
+            _get_block_sizes_for_extend_attention,
+        )
+
+        _, _, BLOCK_DV, BLOCK_M, _, _ = _get_block_sizes_for_extend_attention(
+            self.head_dim, self.v_head_dim
+        )
+        self.splitkv_out_partial = torch.zeros(
+            (max_bs, self.num_head, self.num_kv_splits, BLOCK_M, BLOCK_DV),
+            dtype=torch.float32,
+            device=self.device,
+        )
+        self.splitkv_lse_partial = torch.full(
+            (max_bs, self.num_head, self.num_kv_splits, BLOCK_M),
+            float("-inf"),
+            dtype=torch.float32,
+            device=self.device,
+        )
+
     def init_forward_metadata_capture_cuda_graph(
         self,
         bs: int,
@@ -1605,18 +1637,6 @@ class AiterAttnBackend(AttentionBackend):
                 kv_indices,
                 self.req_to_token.stride(0),
             )
-            if not self.use_mla:
-                # Non-MLA: update custom_mask and mask_indptr for triton extend kernel
-                custom_mask = self.cuda_graph_custom_mask
-                if spec_info is not None and spec_info.custom_mask is not None:
-                    custom_mask[: spec_info.custom_mask.shape[0]] = (
-                        spec_info.custom_mask
-                    )
-                seq_mask_len = self.num_draft_tokens * (
-                    seq_lens + self.num_draft_tokens
-                )
-                mask_indptr = self.mask_indptr[: bs + 1]
-                mask_indptr[1 : bs + 1] = torch.cumsum(seq_mask_len, dim=0)
 
             kv_last_page_len = self.cuda_graph_kv_last_page_len[:bs]
             max_q_len = self.num_draft_tokens
@@ -1667,7 +1687,10 @@ class AiterAttnBackend(AttentionBackend):
                 )
             else:
                 custom_mask = self.cuda_graph_custom_mask
-                custom_mask[: spec_info.custom_mask.shape[0]] = spec_info.custom_mask
+                if spec_info is not None and spec_info.custom_mask is not None:
+                    custom_mask[: spec_info.custom_mask.shape[0]] = (
+                        spec_info.custom_mask
+                    )
                 seq_mask_len = max_q_len * (seq_lens + max_q_len)
                 mask_indptr = self.mask_indptr[: bs + 1]
                 mask_indptr[1 : bs + 1] = torch.cumsum(seq_mask_len, dim=0)
@@ -2138,38 +2161,9 @@ class AiterAttnBackend(AttentionBackend):
         else:
             # Non-MLA path
             if self.forward_metadata.custom_mask is not None:
-                # Speculative decoding path (TARGET_VERIFY / DRAFT_EXTEND):
-                # Use extend_attention_fwd which supports custom tree masks.
-                # mha_batch_prefill_func does not support custom masks.
-                if layer.qk_head_dim != layer.v_head_dim:
-                    o = q.new_empty(
-                        (q.shape[0], layer.tp_q_head_num * layer.v_head_dim)
-                    )
-                else:
-                    o = torch.empty_like(q)
-
-                # Note: KV cache save already happened at the top of forward_extend
-                self.extend_attention_fwd(
-                    q.contiguous().view(-1, layer.tp_q_head_num, layer.qk_head_dim),
-                    k.contiguous().view(-1, layer.tp_k_head_num, layer.qk_head_dim),
-                    v.contiguous().view(-1, layer.tp_v_head_num, layer.v_head_dim),
-                    o.view(-1, layer.tp_q_head_num, layer.v_head_dim),
-                    forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id),
-                    forward_batch.token_to_kv_pool.get_value_buffer(layer.layer_id),
-                    self.forward_metadata.qo_indptr,
-                    self.forward_metadata.kv_indptr,
-                    self.forward_metadata.kv_indices,
-                    self.forward_metadata.custom_mask,
-                    True,  # causal
-                    self.forward_metadata.mask_indptr,
-                    self.forward_metadata.max_extend_len
-                    or self.forward_metadata.max_q_len,
-                    1.0,  # k_scale
-                    1.0,  # v_scale
-                    layer.scaling,
-                    logit_cap=layer.logit_cap,
+                return self._forward_extend_spec_triton(
+                    q, k, v, layer, forward_batch, sinks
                 )
-                return o
             else:
                 # Regular extend path: use mha_batch_prefill_func
                 k_cache, v_cache = forward_batch.token_to_kv_pool.get_kv_buffer(
@@ -2210,6 +2204,235 @@ class AiterAttnBackend(AttentionBackend):
                 )
 
                 return o.view(-1, layer.tp_q_head_num * layer.head_dim)
+
+    def _forward_extend_spec_split(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        layer: "RadixAttention",
+        forward_batch: ForwardBatch,
+        sinks=None,
+    ):
+        """
+        Optimized non-MLA TARGET_VERIFY attention: split prefix/extend.
+
+        Phase 1: mha_batch_prefill_func (aiter HIP kernel) for prefix KV — bulk of
+                 the computation for long sequences, no custom mask needed.
+        Phase 2: Small PyTorch computation for extend KV with tree mask.
+        Phase 3: Merge outputs using log-sum-exp.
+        """
+        # Guardrails: this optimization assumes uniform draft length per request,
+        # which is true for TARGET_VERIFY.
+        bs = forward_batch.batch_size
+        draft_num = self.forward_metadata.max_q_len
+        if (
+            draft_num is None
+            or self.forward_metadata.custom_mask is None
+            or self.forward_metadata.mask_indptr is None
+            or q.shape[0] != bs * draft_num
+        ):
+            return self._forward_extend_spec_triton(
+                q, k, v, layer, forward_batch, sinks
+            )
+
+        num_heads = layer.tp_q_head_num
+        num_kv_heads = layer.tp_k_head_num
+        qk_head_dim = layer.qk_head_dim
+        v_head_dim = layer.v_head_dim
+        kv_group_num = num_heads // num_kv_heads
+        total_q = q.shape[0]
+
+        qo_indptr = self.forward_metadata.qo_indptr
+        kv_indptr = self.forward_metadata.kv_indptr
+        kv_indices = self.forward_metadata.kv_indices
+        max_q_len = self.forward_metadata.max_q_len
+        max_kv_len = self.forward_metadata.max_kv_len
+
+        # -- Phase 1: prefix attention via aiter optimized kernel --
+        k_cache, v_cache = forward_batch.token_to_kv_pool.get_kv_buffer(
+            layer.layer_id
+        )
+        if self.kv_cache_dtype == fp8_dtype:
+            k_cache = k_cache.to(q.dtype)
+            v_cache = v_cache.to(q.dtype)
+
+        bs0 = bs + 1
+        # causal=False: all draft Q positions are AFTER all prefix KV positions,
+        # so every Q token must attend to every prefix KV token without masking.
+        prefix_result = mha_batch_prefill_func(
+            q.contiguous().view(-1, num_heads, qk_head_dim),
+            k_cache,
+            v_cache,
+            qo_indptr[:bs0],
+            kv_indptr[:bs0],
+            kv_indices,
+            max_q_len,
+            max_kv_len,
+            causal=False,
+            softmax_scale=layer.scaling,
+            logits_soft_cap=layer.logit_cap or 0.0,
+            return_lse=True,
+            return_attn_probs=False,
+            window_size=(-1, -1),
+            sink_ptr=sinks,
+        )
+        o_prefix = prefix_result[0]  # [total_q, num_heads, v_head_dim]
+        lse_prefix = prefix_result[1]
+        if lse_prefix.shape == (num_heads, total_q):
+            lse_prefix = lse_prefix.T
+        elif lse_prefix.shape != (total_q, num_heads):
+            logger.warning(
+                "Aiter split verify path: unexpected LSE shape %s; fallback to Triton",
+                tuple(lse_prefix.shape),
+            )
+            return self._forward_extend_spec_triton(
+                q, k, v, layer, forward_batch, sinks
+            )
+
+        # -- Phase 2: extend attention (draft tokens with tree mask) --
+        q_3d = q.contiguous().view(bs, draft_num, num_heads, qk_head_dim)
+        k_3d = k.contiguous().view(bs, draft_num, num_kv_heads, qk_head_dim)
+        v_3d = v.contiguous().view(bs, draft_num, num_kv_heads, v_head_dim)
+
+        if kv_group_num > 1:
+            k_3d = k_3d.repeat_interleave(kv_group_num, dim=2)
+            v_3d = v_3d.repeat_interleave(kv_group_num, dim=2)
+
+        # QK scores: [bs, num_heads, draft_num, draft_num]
+        qk = torch.einsum("bqhd,bkhd->bhqk", q_3d, k_3d) * layer.scaling
+
+        if layer.logit_cap and layer.logit_cap > 0:
+            qk = layer.logit_cap * torch.tanh(qk / layer.logit_cap)
+
+        # Extract extend sub-mask from the flat custom_mask.
+        # Per-sequence mask layout: [draft_num, seq_lens[i] + draft_num].
+        # We need columns [seq_lens[i] .. seq_lens[i]+draft_num) for each row.
+        custom_mask = self.forward_metadata.custom_mask
+        mask_indptr = self.forward_metadata.mask_indptr
+        seq_lens = forward_batch.seq_lens[:bs]
+
+        row_idx = torch.arange(draft_num, device=q.device)
+        col_idx = torch.arange(draft_num, device=q.device)
+        full_widths = (seq_lens + draft_num).long()
+        offsets = mask_indptr[:bs].long()
+
+        # Vectorized index computation: [bs, draft_num, draft_num]
+        gather_idx = (
+            offsets[:, None, None]
+            + row_idx[None, :, None] * full_widths[:, None, None]
+            + seq_lens[:, None, None].long()
+            + col_idx[None, None, :]
+        )
+        extend_mask = custom_mask[gather_idx].bool()
+
+        # Apply tree mask  [bs, 1, draft_num, draft_num] broadcasts over heads
+        qk = qk.masked_fill(~extend_mask.unsqueeze(1), float("-inf"))
+
+        lse_extend = torch.logsumexp(qk, dim=-1)  # [bs, num_heads, draft_num]
+        attn_w = torch.softmax(qk, dim=-1)
+        o_extend = torch.einsum(
+            "bhqk,bkhd->bqhd", attn_w, v_3d
+        )  # [bs, draft_num, num_heads, v_head_dim]
+
+        o_extend = o_extend.reshape(total_q, num_heads, v_head_dim)
+        lse_extend = lse_extend.permute(0, 2, 1).reshape(
+            total_q, num_heads
+        )  # [total_q, num_heads]
+
+        # -- Phase 3: merge using log-sum-exp --
+        lse_max = torch.maximum(lse_prefix, lse_extend)
+        w_prefix = torch.exp(lse_prefix - lse_max)
+        w_extend = torch.exp(lse_extend - lse_max)
+        w_sum = w_prefix + w_extend
+        w_sum = torch.clamp(w_sum, min=1e-20)
+
+        o = (
+            w_prefix.unsqueeze(-1) * o_prefix
+            + w_extend.unsqueeze(-1) * o_extend
+        ) / w_sum.unsqueeze(-1)
+
+        return o.reshape(-1, num_heads * v_head_dim)
+
+    def _forward_extend_spec_triton(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        layer: "RadixAttention",
+        forward_batch: ForwardBatch,
+        sinks=None,
+    ):
+        """
+        Triton kernel path for non-MLA speculative decoding attention.
+
+        For TARGET_VERIFY uses the split-KV kernel which parallelises the
+        long prefix KV iteration across multiple GPU workers.  Other modes
+        fall back to the original serial extend_attention_fwd.
+        """
+        if layer.qk_head_dim != layer.v_head_dim:
+            o = q.new_empty(
+                (q.shape[0], layer.tp_q_head_num * layer.v_head_dim)
+            )
+        else:
+            o = torch.empty_like(q)
+
+        q_3d = q.contiguous().view(-1, layer.tp_q_head_num, layer.qk_head_dim)
+        k_3d = k.contiguous().view(-1, layer.tp_k_head_num, layer.qk_head_dim)
+        v_3d = v.contiguous().view(-1, layer.tp_v_head_num, layer.v_head_dim)
+        o_3d = o.view(-1, layer.tp_q_head_num, layer.v_head_dim)
+
+        use_splitkv = (
+            forward_batch.forward_mode.is_target_verify()
+            and self.num_kv_splits > 1
+        )
+
+        if use_splitkv:
+            self.extend_attention_fwd_splitkv(
+                q_3d,
+                k_3d,
+                v_3d,
+                o_3d,
+                forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id),
+                forward_batch.token_to_kv_pool.get_value_buffer(layer.layer_id),
+                self.forward_metadata.qo_indptr,
+                self.forward_metadata.kv_indptr,
+                self.forward_metadata.kv_indices,
+                self.forward_metadata.custom_mask,
+                True,  # causal
+                self.forward_metadata.mask_indptr,
+                self.forward_metadata.max_extend_len
+                or self.forward_metadata.max_q_len,
+                1.0,  # k_scale
+                1.0,  # v_scale
+                sm_scale=layer.scaling,
+                logit_cap=layer.logit_cap,
+                num_kv_splits=self.num_kv_splits,
+                out_partial=self.splitkv_out_partial,
+                lse_partial=self.splitkv_lse_partial,
+            )
+        else:
+            self.extend_attention_fwd(
+                q_3d,
+                k_3d,
+                v_3d,
+                o_3d,
+                forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id),
+                forward_batch.token_to_kv_pool.get_value_buffer(layer.layer_id),
+                self.forward_metadata.qo_indptr,
+                self.forward_metadata.kv_indptr,
+                self.forward_metadata.kv_indices,
+                self.forward_metadata.custom_mask,
+                True,  # causal
+                self.forward_metadata.mask_indptr,
+                self.forward_metadata.max_extend_len
+                or self.forward_metadata.max_q_len,
+                1.0,  # k_scale
+                1.0,  # v_scale
+                layer.scaling,
+                logit_cap=layer.logit_cap,
+            )
+        return o
 
     def forward_decode(
         self,
