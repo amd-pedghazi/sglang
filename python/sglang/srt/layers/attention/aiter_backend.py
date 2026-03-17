@@ -1984,7 +1984,7 @@ class AiterAttnBackend(AttentionBackend):
                         == forward_batch.extend_seq_lens.shape
                     )
 
-                    if _use_fp8_prefill_attn:
+                    if _use_fp8_prefill_attn and not self._need_head_pad:
                         return self.mla_fp8_prefill_attn(q, k, v, layer)
                     else:
                         return flash_attn_varlen_func(
