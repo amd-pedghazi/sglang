@@ -1425,7 +1425,10 @@ class AiterAttnBackend(AttentionBackend):
                 )
             else:
                 custom_mask = self.cuda_graph_custom_mask
-                custom_mask[: spec_info.custom_mask.shape[0]] = spec_info.custom_mask
+                if spec_info is not None and spec_info.custom_mask is not None:
+                    custom_mask[: spec_info.custom_mask.shape[0]] = (
+                        spec_info.custom_mask
+                    )
                 seq_mask_len = max_q_len * (seq_lens + max_q_len)
                 mask_indptr = self.mask_indptr
                 mask_indptr[1 : bs + 1] = torch.cumsum(seq_mask_len[:bs], dim=0)
@@ -1809,7 +1812,10 @@ class AiterAttnBackend(AttentionBackend):
                 )
             else:
                 custom_mask = self.cuda_graph_custom_mask
-                custom_mask[: spec_info.custom_mask.shape[0]] = spec_info.custom_mask
+                if spec_info is not None and spec_info.custom_mask is not None:
+                    custom_mask[: spec_info.custom_mask.shape[0]] = (
+                        spec_info.custom_mask
+                    )
                 seq_mask_len = max_q_len * (seq_lens + max_q_len)
                 mask_indptr = self.mask_indptr[: bs + 1]
                 mask_indptr[1 : bs + 1] = torch.cumsum(seq_mask_len, dim=0)
@@ -2319,9 +2325,9 @@ class AiterAttnBackend(AttentionBackend):
                     o = torch.empty_like(q)
 
                 self.extend_attention_fwd(
-                    q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
-                    k.contiguous(),
-                    v.contiguous(),
+                    q.contiguous().view(-1, layer.tp_q_head_num, layer.qk_head_dim),
+                    k.contiguous().view(-1, layer.tp_k_head_num, layer.qk_head_dim),
+                    v.contiguous().view(-1, layer.tp_v_head_num, layer.v_head_dim),
                     o.view(-1, layer.tp_q_head_num, layer.v_head_dim),
                     forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id),
                     forward_batch.token_to_kv_pool.get_value_buffer(layer.layer_id),
