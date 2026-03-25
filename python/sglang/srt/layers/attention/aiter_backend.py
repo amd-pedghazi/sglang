@@ -2441,7 +2441,7 @@ class AiterAttnBackend(AttentionBackend):
                 )
             else:
                 forward_batch.token_to_kv_pool.set_kv_buffer(
-                    layer, forward_batch.out_cache_loc, k, v
+                    layer, forward_batch.out_cache_loc, k, v, k_descale, v_descale
                 )
 
         if self.use_mla:

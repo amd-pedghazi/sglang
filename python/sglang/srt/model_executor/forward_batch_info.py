@@ -545,6 +545,27 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         if ret.forward_mode.is_decode() or ret.forward_mode.is_target_verify():
             if ret.positions is None:
                 ret.positions = clamp_position(batch.seq_lens)
+
+            # On ROCm, decode attention kernels (split-K paged attention) produce
+            # incorrect results for certain model configurations. Route decode
+            # through the extend (prefill) attention path which works correctly.
+            if is_hip() and ret.forward_mode.is_decode():
+                bs = ret.batch_size
+                prefix_lens = torch.clamp(
+                    batch.seq_lens - 1, min=0
+                )
+                ret.extend_seq_lens = torch.ones(
+                    bs, dtype=torch.int32, device=device
+                )
+                ret.extend_prefix_lens = prefix_lens.to(torch.int32)
+                ret.extend_start_loc = torch.arange(
+                    bs, dtype=torch.int32, device=device
+                )
+                ret.extend_num_tokens = bs
+                ret.extend_prefix_lens_cpu = prefix_lens.tolist()
+                ret.extend_seq_lens_cpu = [1] * bs
+                ret.extend_logprob_start_lens_cpu = [0] * bs
+                ret.forward_mode = ForwardMode.EXTEND
         else:
             assert isinstance(batch.extend_seq_lens, list)
             assert isinstance(batch.extend_prefix_lens, list)
