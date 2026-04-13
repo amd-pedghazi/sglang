@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import contextlib
+import os
 from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
@@ -23,6 +24,11 @@ _is_cuda = is_cuda()
 _is_hip = is_hip()
 _is_npu = is_npu()
 _is_fp8_fnuz = is_fp8_fnuz()
+
+_NSA_MQA_CHUNK_K = int(os.environ.get("SGLANG_NSA_MQA_CHUNK_K", "0")) or None
+_NSA_MQA_CU_COUNT = int(os.environ.get("SGLANG_NSA_MQA_CU_COUNT", "0")) or None
+_NSA_MQA_WAVE_PER_EU = int(os.environ.get("SGLANG_NSA_MQA_WAVE_PER_EU", "0")) or None
+
 if _is_cuda:
     try:
         import deep_gemm
@@ -93,6 +99,11 @@ class BaseIndexerMetadata(ABC):
         """
 
     def get_indexer_seq_len_cpu(self) -> torch.Tensor:
+        """
+        Return: seq lens for each batch.
+        """
+
+    def get_indexer_seq_len(self) -> torch.Tensor:
         """
         Return: seq lens for each batch.
         """
@@ -430,6 +441,16 @@ class Indexer(MultiPlatformOp):
                 device=q_fp8.device,
                 dtype=torch.float32,
             )
+            mqa_kwargs = dict(
+                Preshuffle=False,
+                KVBlockSize=block_kv,
+            )
+            if _NSA_MQA_CHUNK_K is not None:
+                mqa_kwargs["ChunkK"] = _NSA_MQA_CHUNK_K
+            if _NSA_MQA_CU_COUNT is not None:
+                mqa_kwargs["TotalCuCount"] = _NSA_MQA_CU_COUNT
+            if _NSA_MQA_WAVE_PER_EU is not None:
+                mqa_kwargs["WavePerEU"] = _NSA_MQA_WAVE_PER_EU
             deepgemm_fp8_paged_mqa_logits(
                 q_fp8,
                 kv_cache_fp8,
@@ -438,11 +459,7 @@ class Indexer(MultiPlatformOp):
                 seqlens_32,
                 block_tables,
                 max_seq_len,
-                Preshuffle=False,
-                KVBlockSize=block_kv,
-                ChunkK=128,
-                TotalCuCount=256,
-                WavePerEU=5,
+                **mqa_kwargs,
             )
         else:
             logits = deep_gemm.fp8_paged_mqa_logits(
@@ -538,11 +555,12 @@ class Indexer(MultiPlatformOp):
 
         ks, ke = metadata.get_indexer_kvcache_range()
 
-        seq_len_sum = forward_batch.seq_lens_sum
-        max_seq_len = torch.max(forward_batch.seq_lens_cpu).item()
+        indexer_seq_lens_cpu = metadata.get_indexer_seq_len_cpu()
+        seq_len_sum = torch.sum(indexer_seq_lens_cpu).item()
+        max_seq_len = torch.max(indexer_seq_lens_cpu).item()
         k_fp8, k_scale = forward_batch.token_to_kv_pool.get_index_k_scale_buffer(
             layer_id,
-            forward_batch.seq_lens,
+            metadata.get_indexer_seq_len(),
             block_tables,
             seq_len_sum,
             max_seq_len,

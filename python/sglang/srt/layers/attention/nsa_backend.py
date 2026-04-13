@@ -138,6 +138,8 @@ class NSAMetadata:
     indexer_k_start_end: Optional[Tuple[torch.Tensor, torch.Tensor]] = None
     # seq lens for each batch.
     indexer_seq_lens_cpu: Optional[torch.Tensor] = None
+    # seq lens for each batch (on device).
+    indexer_seq_lens: Optional[torch.Tensor] = None
     # batch index for each token.
     token_to_batch_idx: Optional[torch.Tensor] = None
 
@@ -193,6 +195,9 @@ class NSAIndexerMetadata(BaseIndexerMetadata):
 
     def get_indexer_kvcache_range(self) -> Tuple[torch.Tensor, torch.Tensor]:
         return self.attn_metadata.indexer_k_start_end
+
+    def get_indexer_seq_len(self) -> torch.Tensor:
+        return self.attn_metadata.indexer_seq_lens
 
     def get_indexer_seq_len_cpu(self) -> torch.Tensor:
         return self.attn_metadata.indexer_seq_lens_cpu
@@ -329,6 +334,11 @@ class NativeSparseAttnBackend(
                 device=self.device,
             )
 
+            self.need_pad_heads = self.num_q_heads < 16
+            self.head_repeat_factor = (
+                16 // self.num_q_heads if self.num_q_heads < 16 else 1
+            )
+
         # Speculative decoding
         self.topk = model_runner.server_args.speculative_eagle_topk or 0
         self.speculative_num_steps = speculative_num_steps
@@ -404,6 +414,7 @@ class NativeSparseAttnBackend(
         bs_idx_cpu = None
         # seq_len_cpu of selected sequences
         indexer_seq_lens_cpu = forward_batch.seq_lens_cpu
+        indexer_seq_lens = forward_batch.seq_lens
 
         if forward_batch.forward_mode.is_decode_or_idle():
             extend_seq_lens_cpu = [1] * batch_size
@@ -504,6 +515,7 @@ class NativeSparseAttnBackend(
                     )
                 )
                 indexer_seq_lens_cpu = indexer_seq_lens_cpu[bs_idx_cpu]
+                indexer_seq_lens = indexer_seq_lens[bs_idx]
                 cache_seqlens_int32 = cache_seqlens_int32[bs_idx]
                 cu_seqlens_k = compute_cu_seqlens(cache_seqlens_int32)
                 max_seqlen_k = (
@@ -641,6 +653,7 @@ class NativeSparseAttnBackend(
             topk_indices_offset=topk_indices_offset,
             indexer_k_start_end=indexer_k_start_end,
             indexer_seq_lens_cpu=indexer_seq_lens_cpu,
+            indexer_seq_lens=indexer_seq_lens,
             token_to_batch_idx=token_to_batch_idx,
         )
         self.forward_metadata = metadata
@@ -1806,6 +1819,21 @@ class NativeSparseAttnBackend(
         else:
             o = torch.empty_like(q)
 
+        if self.need_pad_heads:
+            q_kernel = q.view(
+                -1, layer.tp_q_head_num, layer.head_dim
+            ).repeat_interleave(self.head_repeat_factor, dim=1)
+            o_kernel = q.new_empty(
+                (
+                    q.shape[0],
+                    layer.tp_q_head_num * self.head_repeat_factor,
+                    layer.v_head_dim,
+                )
+            )
+        else:
+            q_kernel = q.view(-1, layer.tp_q_head_num, layer.head_dim)
+            o_kernel = o.view(-1, layer.tp_q_head_num, layer.v_head_dim)
+
         kv_indptr = self.kv_indptr
 
         non_minus1_mask = page_table_1 != -1
@@ -1816,9 +1844,9 @@ class NativeSparseAttnBackend(
         get_valid_kv_indices(page_table_1, kv_indptr, kv_indices, bs)
 
         mla_decode_fwd(
-            q.view(-1, layer.tp_q_head_num, layer.head_dim),
+            q_kernel,
             kv_cache.view(-1, 1, 1, layer.head_dim),
-            o.view(-1, layer.tp_q_head_num, layer.v_head_dim),
+            o_kernel,
             metadata.cu_seqlens_q,
             kv_indptr,
             kv_indices,
@@ -1827,7 +1855,10 @@ class NativeSparseAttnBackend(
             sm_scale=layer.scaling,
             logit_cap=layer.logit_cap,
         )
-        # kv_cache = kv_cache.view(-1, 1, layer.head_dim)
+
+        if self.need_pad_heads:
+            o = o_kernel[:, :: self.head_repeat_factor, :]
+
         return o
 
     def _forward_aiter_extend(
@@ -1844,6 +1875,21 @@ class NativeSparseAttnBackend(
             o = q.new_empty((num_tokens, layer.tp_q_head_num * layer.v_head_dim))
         else:
             o = torch.empty_like(q)
+
+        if self.need_pad_heads:
+            q_kernel = q.view(
+                -1, layer.tp_q_head_num, layer.head_dim
+            ).repeat_interleave(self.head_repeat_factor, dim=1)
+            o_kernel = q.new_empty(
+                (
+                    num_tokens,
+                    layer.tp_q_head_num * self.head_repeat_factor,
+                    layer.v_head_dim,
+                )
+            )
+        else:
+            q_kernel = q.view(-1, layer.tp_q_head_num, layer.head_dim)
+            o_kernel = o.view(-1, layer.tp_q_head_num, layer.v_head_dim)
 
         non_minus1_mask = page_table_1 != -1
         non_minus1_counts = non_minus1_mask.sum(dim=1)
@@ -1866,9 +1912,9 @@ class NativeSparseAttnBackend(
         )
         # TODO support more forward_mode
         mla_decode_fwd(
-            q.view(-1, layer.tp_q_head_num, layer.head_dim),
+            q_kernel,
             kv_cache.view(-1, 1, 1, layer.head_dim),
-            o.view(-1, layer.tp_q_head_num, layer.v_head_dim),
+            o_kernel,
             cu_seqlens_q,
             kv_indptr,
             kv_indices,
@@ -1877,6 +1923,10 @@ class NativeSparseAttnBackend(
             sm_scale=layer.scaling,
             logit_cap=layer.logit_cap,
         )
+
+        if self.need_pad_heads:
+            o = o_kernel[:, :: self.head_repeat_factor, :]
+
         return o
 
     def _forward_trtllm(

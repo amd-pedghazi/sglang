@@ -1145,7 +1145,7 @@ class AiterAttnBackend(AttentionBackend):
         max_num_tokens: int,
         kv_indices_buf: Optional[torch.Tensor] = None,
     ):
-        self.cuda_graph_kv_last_page_len = torch.ones(max_bs, dtype=torch.int)
+        self.cuda_graph_kv_last_page_len = torch.ones(max_bs, dtype=torch.int, device=self.device)
         if kv_indices_buf is None:
             self.cuda_graph_kv_indices = torch.zeros(
                 (max_bs * self.max_context_len),
@@ -1984,7 +1984,7 @@ class AiterAttnBackend(AttentionBackend):
                         == forward_batch.extend_seq_lens.shape
                     )
 
-                    if _use_fp8_prefill_attn:
+                    if _use_fp8_prefill_attn and not self._need_head_pad:
                         return self.mla_fp8_prefill_attn(q, k, v, layer)
                     else:
                         return flash_attn_varlen_func(
