@@ -2600,8 +2600,14 @@ class DeepseekSparseAttnMultiStepBackend:
             )
 
             # Use multi-backend fused copy when we have 3 or more backends
-            # This is 3x faster than calling the single-backend copy 3 times
-            if self.speculative_num_steps > 3:
+            # This is 3x faster than calling the single-backend copy 3 times.
+            # NOTE: the fused_metadata_copy JIT kernel is CUDA-only (includes
+            # <cuda_runtime.h>); on HIP/ROCm it fails to compile. Because this
+            # runs every decode step (out-of-graph metadata fill), a failed JIT
+            # import here would respawn a failing ninja build per step and crawl.
+            # On HIP, skip straight to the per-backend loop (metadata copies are
+            # tiny for decode bs, so the "3x faster fused" gain is negligible).
+            if self.speculative_num_steps > 3 and not _is_hip:
                 try:
                     from sglang.jit_kernel.fused_metadata_copy import (
                         fused_metadata_copy_multi_cuda,
