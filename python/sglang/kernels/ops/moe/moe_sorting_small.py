@@ -482,6 +482,10 @@ def apply_aiter_small_moe_sort_patch() -> None:
             and _small_sort_supported(
                 topk_ids, int(block_size), expert_mask, num_local_tokens
             )
+            # aiter's multi-phase sort is faster than the distributed variant
+            and (
+                dispatch_policy != 2 or topk_ids.numel() <= min(64, 2 * int(block_size))
+            )
         ):
             device = topk_ids.device
             M, topk = topk_ids.shape
