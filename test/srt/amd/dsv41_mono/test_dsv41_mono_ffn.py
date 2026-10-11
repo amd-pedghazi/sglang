@@ -62,6 +62,30 @@ def bf16_ulps(a, b):
     return ulps.max().item(), (a != b).float().mean().item()
 
 
+def hc_post_fp64(a, res, post, comb):
+    """fp64 hc_post of the reduced bf16 attention output ``a``: (each element, its largest term's |.|)."""
+    terms = torch.cat(
+        [
+            (post.double()[:, :, None] * a.double()[:, None, :])[..., None],
+            (comb.double()[..., None] * res.double()[:, :, None, :]).permute(
+                0, 2, 3, 1
+            ),
+        ],
+        -1,
+    )
+    return terms.sum(-1), terms.abs().amax(-1)  # fmt: skip
+
+
+def term_ulps(out, ref, big):
+    """Max |out - ref| in bf16 ulps of ``big``: a near-cancelling sum has no meaningful ulp of its own."""
+    _, e = torch.frexp(big)
+    return (
+        ((out.double() - ref).abs() / torch.ldexp(torch.ones_like(big), e - 8))
+        .max()
+        .item()
+    )
+
+
 # ---------------------------------------------------------------- MX helpers (the launch's rules)
 def code_ceil(v):
     """Biased exponent of the smallest power of two >= v (v > 0), clamped to [lo, 254]."""
@@ -230,6 +254,17 @@ def seam_inputs(M, tp, rank, dev):
     return part, res, post.contiguous(), comb.contiguous(), pre.contiguous()
 
 
+def reduced(part):
+    """The attention all-reduce as an fp32 sum in rank order, as the kernel sums (RCCL's order differs,
+    which flips bf16 roundings)."""
+    parts = [torch.empty_like(part) for _ in range(dist.get_world_size())]
+    dist.all_gather(parts, part)
+    a = parts[0].float()
+    for p in parts[1:]:
+        a = a + p.float()
+    return a.to(torch.bfloat16)
+
+
 def sglang_ffn_seam(part, res, post, comb, pre, w):
     """SGLang's decode chain for the same step: the attention all-reduce, the gfx950 boundary kernel
     (attention post, collapse with the attention pre, the FFN mixes) and its norm launch."""
@@ -238,14 +273,8 @@ def sglang_ffn_seam(part, res, post, comb, pre, w):
         rmsnorm_with_sinkhorn,
     )
 
-    # an fp32 sum in rank order, as the kernel sums: RCCL's order differs, which flips bf16 roundings
-    parts = [torch.empty_like(part) for _ in range(dist.get_world_size())]
-    dist.all_gather(parts, part)
-    a = parts[0].float()
-    for p in parts[1:]:
-        a = a + p.float()
     res2, y, co = hc_boundary_fused_deferred(
-        a.to(torch.bfloat16), res, post, comb, pre, w["hc_fn"], w["hc_scale"], w["hc_base"],
+        reduced(part), res, post, comb, pre, w["hc_fn"], w["hc_scale"], w["hc_base"],
         HC, 20, RMS_EPS, HC_EPS,
     )  # fmt: skip
     _, normed = rmsnorm_with_sinkhorn(y, w["norm"], RMS_EPS, co, fake_quant=False)
@@ -289,11 +318,14 @@ def main():
         same = (ids.sort(1).values == ids_ref.sort(1).values).all(1)
         tok = F.cosine_similarity(out.float(), gold.float(), dim=1)
         res_ulps, res_share = bf16_ulps(res_o, res2)
+        ref64, big = hc_post_fp64(reduced(part), res, post, comb)
+        err, err_sgl = term_ulps(res_o, ref64, big), term_ulps(res2, ref64, big)
         checks = {
             "residual exact": torch.equal(res_o, res2),
-            # the same fp32 math in another operation order: rare flipped bf16 roundings (a flip of the
-            # reduced attention output, times post <= 2, can be 2 ulp of a smaller residual)
-            "residual <= 2 ulp, <= 0.01% differ": res_ulps <= 2.0 and res_share <= 1e-4,
+            # the same fp32 math in another operation order: rare flipped bf16 roundings. The error against
+            # an fp64 hc_post, in ulps of each element's largest term, stays within SGLang's own
+            "residual err <= SGLang's + 0.5 ulp, <= 0.01% differ": err <= err_sgl + 0.5
+            and res_share <= 1e-4,
             "post": torch.allclose(post_o.view(M, HC), post2, rtol=1e-4, atol=1e-5),
             "comb": torch.allclose(comb_o, comb2, rtol=1e-4, atol=1e-5),
             "pre": torch.allclose(pre_o, pre2, rtol=1e-4, atol=1e-5),
@@ -310,7 +342,8 @@ def main():
         checks["ranks agree"] = torch.equal(ref0, out)
         stats = (
             f"res max|d| {(res_o.float() - res2.float()).abs().max().item():.2e} "
-            f"({res_ulps:.2f} ulp, {100 * res_share:.4f}% differ), "
+            f"({res_ulps:.2f} ulp, {100 * res_share:.4f}% differ; vs fp64 {err:.2f} / SGLang {err_sgl:.2f} "
+            f"ulp of the largest term), "
             f"normed cos {cos(normed, normed_ref):.6f} rel {rel(normed, normed_ref):.4f}, "
             f"moe cos {cos(out, gold):.6f} rel {rel(out, gold):.4f} min-token cos {tok.min().item():.5f}, "
             f"routing same {same.float().mean().item():.3f}"
