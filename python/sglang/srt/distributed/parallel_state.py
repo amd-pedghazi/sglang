@@ -768,11 +768,16 @@ class GroupCoordinator:
             and not self.ca_comm.disabled
             and self.ca_comm.should_custom_ar(input_)
         )
+        should_use_quick_allreduce_first = (
+            self.qr_comm is not None
+            and self.qr_comm.should_quick_allreduce_first(input_)
+        )
         if (
             pynccl_comm is not None
             and self.is_symmetric_memory_enabled()
             and not should_use_pymscclpp_allreduce
             and not should_use_custom_allreduce
+            and not should_use_quick_allreduce_first
         ):
             self.debug_check_symmetric_mempool(self, {"input": input_}, "all_reduce")
             with pynccl_comm.change_state(enable=True):
@@ -973,6 +978,12 @@ class GroupCoordinator:
                 self.pymscclpp_comm is not None
                 and self.pymscclpp_comm.should_mscclpp_allreduce(input_)
             )
+        # Inside SGLANG_QUICK_REDUCE_FIRST_MIN_BYTES' window, QuickReduce goes
+        # ahead of the custom all-reduce; outside it the order below is unchanged.
+        if self.qr_comm is not None and self.qr_comm.should_quick_allreduce_first(
+            input_
+        ):
+            return "qr"
         if (
             self.ca_comm is not None
             and not self.ca_comm.disabled

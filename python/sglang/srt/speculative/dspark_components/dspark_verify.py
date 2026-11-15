@@ -63,6 +63,12 @@ from sglang.srt.speculative.dspark_components.dspark_planner import (
     VerifyWindow,
     apply_logits_adjustments_strided,
 )
+from sglang.srt.speculative.dspark_components.dspark_target_shards import (
+    TargetShard,
+    full_logits_unless_kept,
+    shard_of_logits,
+    sharded_target_tokens,
+)
 from sglang.srt.speculative.ragged_verify import RaggedVerifyLayout
 from sglang.srt.speculative.spec_tp_sync import SpecTpSync, SpecTpSyncSite
 from sglang.srt.speculative.spec_utils import (
@@ -175,6 +181,9 @@ class TargetVerifyExecutor:
         # Block-wise rejection draws (blockwise_rejection.py); None keeps the classic kernel.
         self._rejection_noise = rejection_noise
         self._simulated_correct_len = simulated_correct_len
+        # The target LogitsProcessor whose verify logits stay on the vocabulary shards
+        # (SGLANG_DSPARK_TARGET_VOCAB_SHARDS); None keeps the gathered logits.
+        self.target_logits_processor = None
 
     def accept_and_finalize(
         self,
@@ -190,18 +199,23 @@ class TargetVerifyExecutor:
         prefix_lens: torch.Tensor,
         draft_tokens: torch.Tensor,
         simulate_bonus_sampling_info=None,
+        target_shard: Optional[TargetShard] = None,
+        tp_group=None,
     ) -> AcceptOuts:
         """Produce the per-request accept outcome after target verify.
 
         Folded path: the accept/finalize/out-token kernels already ran inside
         the target-verify cuda graph (DsparkVerifyEpilogue); read its buffers.
         Eager path: run them here. Both apply the SGLANG_SIMULATE_ACC_LEN
-        override drawn by begin_simulated_step.
+        override drawn by begin_simulated_step. With ``target_shard``,
+        ``target_logits`` is this rank's vocabulary shard (accept_draft_tokens).
         """
         if folded_accept:
             self.verify_epilogue.note_static_verify(bs)
             return self.verify_epilogue.read_accept(bs)
 
+        # the simulated bonus samples the full target row
+        assert target_shard is None or simulate_bonus_sampling_info is None
         correct_len, bonus, cap_trim_lens = accept_draft_tokens(
             candidates=verify_ids_2d,
             target_logits=target_logits,
@@ -214,6 +228,8 @@ class TargetVerifyExecutor:
             fused_argmax=self._fused_argmax,
             block_verification=self._block_verification,
             rejection_noise=self._rejection_noise,
+            target_shard=target_shard,
+            tp_group=tp_group,
         )
         greedy_bonus = simulate_bonus_sampling_info is None and (
             sampling_info is None or sampling_info.is_all_greedy
@@ -307,6 +323,7 @@ class TargetVerifyExecutor:
         verify_ids_2d: torch.Tensor,
         verify_window: VerifyWindow,
         sampling_info,
+        keep_target_shards: bool = False,
     ) -> TargetVerifyResult:
         verify_w = self.verify_num_draft_tokens
         positions_2d = verify_window.positions_2d
@@ -337,6 +354,13 @@ class TargetVerifyExecutor:
             verify_input=verify_input,
             seq_lens_cpu_backup=seq_lens_cpu_backup,
             seq_lens_sum_backup=seq_lens_sum_backup,
+        )
+        # before the adjustments, which need the full rows
+        logits_output = result.logits_output
+        logits_output.next_token_logits = full_logits_unless_kept(
+            logits_output.next_token_logits,
+            self.target_logits_processor,
+            keep_target_shards,
         )
 
         if sampling_info is not None:
@@ -477,6 +501,7 @@ class TargetVerifyExecutor:
         sampling_info,
         verify_window: VerifyWindow,
         inject_gate: bool = False,
+        keep_target_shards: bool = False,
     ) -> tuple[TargetVerifyResult, torch.Tensor]:
         ragged_window = BuildRaggedVerifyWindow.execute(
             batch=batch,
@@ -528,6 +553,10 @@ class TargetVerifyExecutor:
                 fill_value=0.0,
                 verify_num_draft_tokens=stride,
             )
+        # before the adjustments, which need the full rows
+        strided_logits = full_logits_unless_kept(
+            strided_logits, self.target_logits_processor, keep_target_shards
+        )
         apply_logits_adjustments_strided(
             next_token_logits=strided_logits,
             sampling_info=sampling_info,
@@ -615,6 +644,10 @@ class DsparkVerifyEpilogue:
         self._sim_greedy_bs: Optional[int] = None
         self.stride = int(verify_num_draft_tokens)
         self._fused_argmax = bool(fused_argmax)
+        # Set by use_target_shards before graph capture: the verify logits are then this
+        # rank's vocabulary shard and the greedy accept reads the shard keys.
+        self.target_shard: Optional[TargetShard] = None
+        self._tp_group = None
         self.gamma = self.stride - 1
         self.commit_ctx = commit_ctx
         self._tp_sync = tp_sync
@@ -833,6 +866,19 @@ class DsparkVerifyEpilogue:
         low, high = self._accept_tail_bs
         return self._fused_accept_tail and low <= bs and (high == 0 or bs <= high)
 
+    def use_target_shards(self, shard: TargetShard, tp_group) -> None:
+        """Before graph capture: the verify logits are this rank's vocabulary shard."""
+        # the simulated acceptance samples its bonus from the full target row
+        assert self.simulated_correct_len is None and not self.simulate_fold
+        self.target_shard, self._tp_group = shard, tp_group
+
+    def _target_predict(self, logits: torch.Tensor) -> torch.Tensor:
+        """The target's greedy token of every verify row."""
+        shard = shard_of_logits(logits, self.target_shard)
+        if shard is not None:
+            return sharded_target_tokens(logits, shard, self._tp_group)
+        return _row_argmax(logits, fused=self._fused_argmax)
+
     def _static_accept_tail(
         self, *, candidates, logits, seq_lens, verify_lens, gated: bool
     ) -> Optional[torch.Tensor]:
@@ -840,7 +886,7 @@ class DsparkVerifyEpilogue:
         simulate_fold the bonus select runs in the tail."""
         bs = candidates.shape[0]
         # Under simulate_fold the tail does not read the argmax; it still runs as served.
-        target_predict = _row_argmax(logits, fused=self._fused_argmax).view(-1)
+        target_predict = self._target_predict(logits).view(-1)
         bonus_parts = None
         if self.simulate_fold:
             bonus_parts = (
@@ -1042,6 +1088,11 @@ class DsparkVerifyEpilogue:
             verify_num_draft_tokens=self.stride,
             cutoff_verify_lens=cutoff_verify_lens,
             fused_argmax=self._fused_argmax,
+            target_predict=(
+                None
+                if shard_of_logits(logits, self.target_shard) is None
+                else self._target_predict(logits)
+            ),
         )
         if self.simulate_fold:
             # Before the TP broadcast in build_accept_outs: every rank commits rank 0's draw.
@@ -1147,10 +1198,13 @@ def build_accept_outs(
     tp_sync.sync(sync_site, bonus)
     tp_sync.sync(sync_site, cap_trim_lens)
 
+    # with ``out``, the kernels write the static buffers themselves
     finalized = FinalizeAcceptLens.execute(
         correct_len=correct_len,
         cap_trim_lens=cap_trim_lens,
         prefix_lens=prefix_lens,
+        bonus=bonus,
+        out=out,
     )
     out_tokens = BuildOutTokens.execute(
         draft_tokens=draft_tokens,
@@ -1158,8 +1212,13 @@ def build_accept_outs(
         bonus=bonus,
         verify_num_draft_tokens=verify_num_draft_tokens,
         gamma=gamma,
+        out=None if out is None else out.out_tokens,
     )
-    accept = AcceptOuts(
+    if out is not None:
+        if block_accept_lens_out is not None:
+            torch.add(out.commit_lens, out.cap_trim_lens, out=block_accept_lens_out)
+        return out
+    return AcceptOuts(
         correct_len=correct_len,
         bonus=bonus,
         cap_trim_lens=finalized.cap_trim_lens,
@@ -1167,19 +1226,6 @@ def build_accept_outs(
         new_seq_lens=finalized.new_seq_lens,
         out_tokens=out_tokens,
     )
-    if out is not None:
-        out.correct_len.copy_(accept.correct_len)
-        out.bonus.copy_(accept.bonus)
-        out.cap_trim_lens.copy_(accept.cap_trim_lens)
-        out.commit_lens.copy_(accept.commit_lens)
-        out.new_seq_lens.copy_(accept.new_seq_lens)
-        out.out_tokens.copy_(accept.out_tokens)
-        if block_accept_lens_out is not None:
-            torch.add(
-                accept.commit_lens, accept.cap_trim_lens, out=block_accept_lens_out
-            )
-        return out
-    return accept
 
 
 def sample_simulated_bonus(
@@ -1306,10 +1352,19 @@ def accept_draft_tokens(
     fused_argmax: bool = False,
     block_verification: bool = False,
     rejection_noise: Optional[RejectionNoise] = None,
+    target_shard: Optional[TargetShard] = None,
+    tp_group=None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """With ``target_shard``, ``target_logits`` is this rank's vocabulary shard: the
+    greedy rows take their tokens from the shard keys, the temperature rows the sharded
+    chain rule. The caller gathers the full logits for any other batch."""
     greedy_mask = draft_block.greedy_mask
     cutoff_verify_lens = None if cutoff_layout is None else cutoff_layout.verify_lens
     all_greedy = sampling_info is None or sampling_info.is_all_greedy
+    target_shard = shard_of_logits(target_logits, target_shard)
+    shard_predict = None
+    if target_shard is not None and (all_greedy or sampling_info.is_any_greedy):
+        shard_predict = sharded_target_tokens(target_logits, target_shard, tp_group)
     if all_greedy:
         return AcceptGreedy.execute(
             candidates=candidates,
@@ -1317,11 +1372,14 @@ def accept_draft_tokens(
             verify_num_draft_tokens=verify_num_draft_tokens,
             cutoff_verify_lens=cutoff_verify_lens,
             fused_argmax=fused_argmax,
+            target_predict=shard_predict,
         )
     if _accepts_on_shards(draft_block, sampling_info, block_verification):
         # Block-wise rejection scans the whole draft vocab. This kernel is the
         # same chain rule and reads the draft logits on the local shard.
         shard = draft_block.vocab_shard
+        if target_shard is not None:
+            assert (shard.start, shard.width) == target_shard[:2], (shard, target_shard)
         sampled = accept_sampling_sharded(
             candidates=candidates,
             target_logits=target_logits,
@@ -1333,7 +1391,10 @@ def accept_draft_tokens(
             key=draft_block.noise.key,
             offset=draft_block.noise.offset,
             verify_lens=cutoff_verify_lens,
+            target_start=None if target_shard is None else 0,
         )
+    elif target_shard is not None:
+        raise ValueError("a vocabulary-shard verify needs the sharded sampling accept")
     elif _blockwise_rejection_applies(
         sampling_info=sampling_info,
         rejection_noise=rejection_noise,
@@ -1373,6 +1434,7 @@ def accept_draft_tokens(
         verify_num_draft_tokens=verify_num_draft_tokens,
         cutoff_verify_lens=cutoff_verify_lens,
         fused_argmax=fused_argmax,
+        target_predict=shard_predict,
     )
     sampling_len, sampling_bonus, sampling_trim = sampled
     selected = SelectMixedAccept.execute(

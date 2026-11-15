@@ -35,6 +35,9 @@ from sglang.kernels.ops.attention.dsv4.dequant_k_cache import (
     fp8_dtype,
     gather_dequant_requant_fp8_paged_dsv4,
 )
+from sglang.kernels.ops.attention.dsv4.index_logits import (
+    flat_index_logits_row_alignment,
+)
 from sglang.kernels.ops.attention.dsv4.kv_layout import KVLayout
 from sglang.kernels.ops.attention.dsv4.metadata_kernel import (
     fill_all_compressed_indices,
@@ -85,6 +88,7 @@ from sglang.srt.layers.attention.dsv4.v41_indexer import (
     CapturedPrefillInputs,
     DecodeInputs,
     PrefillInputs,
+    RowShard,
     is_sm100_or_newer,
     make_candidate_indexer,
     make_full_topk_indexer,
@@ -1035,6 +1039,11 @@ def _pad_rows(t: torch.Tensor, *, num_rows: int) -> torch.Tensor:
     if t.shape[0] == num_rows:
         return t
     return torch.nn.functional.pad(t, (0, num_rows - t.shape[0]))
+
+
+# Arbitrary floor: below it the dense scores are short enough that the
+# all-gather's fixed latency eats most of what sharding saves.
+_INDEXER_TP_SHARD_MIN_ROWS = 512
 
 
 def _prefill_graph_max_seq_len() -> Optional[int]:
@@ -4031,6 +4040,24 @@ class DeepseekV4AttnBackend(
                 if self._low_ratio_prefill_reads_page_indices(forward_batch)
                 else None
             ),
+        )
+
+    def _indexer_row_shard(self, layer, *, num_rows: int) -> Optional[RowShard]:
+        # Every input here is the same on all attention-TP ranks, so either all
+        # of them reach the all-gather or none does.
+        parallel = get_parallel()
+        if (
+            not envs.SGLANG_OPT_DSV4_INDEXER_TP_SHARD.get()
+            or parallel.attn_tp_size == 1
+            or parallel.attn_cp_size != 1
+            or num_rows < _INDEXER_TP_SHARD_MIN_ROWS
+        ):
+            return None
+        return RowShard(
+            group=parallel.attn_tp_group,
+            rank=parallel.attn_tp_rank,
+            world=parallel.attn_tp_size,
+            row_align=flat_index_logits_row_alignment(layer.indexer.n_heads),
         )
 
     def _low_ratio_prefill_reads_page_indices(self, forward_batch: ForwardBatch):
