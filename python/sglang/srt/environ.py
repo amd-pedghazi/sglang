@@ -1994,6 +1994,11 @@ class Envs:
     # gfx950 DeepSeek-V4.1 prefill: attend with aiter's OPUS sparse kernel over a bf16
     # dequant of the chunk's SWA and compressed history, instead of the decode kernel.
     SGLANG_OPT_HIP_OPUS_SPARSE_PREFILL = EnvBool(False)
+    # With the above: gather the chunk's rows as fp8 (unit scale, RoPE cast to fp8 for
+    # P*V) plus their bf16 RoPE for QK^T, instead of the bf16 dequant, and attend with
+    # aiter's fp8 OPUS kernel. Applies to the V4 cache layout and at most 32 local
+    # heads; other layers keep bf16.
+    SGLANG_OPT_HIP_OPUS_FP8_PREFILL = EnvBool(False)
     # gfx950 MXFP8 dense GEMMs run the in-tree FlyDSL kernel mxfp8_flydsl_gfx95 at prefill
     # sizes; decode stays on aiter.
     SGLANG_OPT_HIP_FLYDSL_MXFP8 = EnvBool(False)
