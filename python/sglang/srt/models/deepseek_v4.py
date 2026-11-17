@@ -30,6 +30,7 @@ from sglang.kernels.ops.attention.dsv4 import (
     fused_q_norm_rope,
     fused_rope_inplace,
 )
+from sglang.kernels.ops.attention.dsv4.opus_sparse_prefill_hip import OpusPackedQ
 from sglang.kernels.ops.attention.dsv4.wo_a import MAX_M as _FUSED_WO_A_MAX_TOKENS
 from sglang.kernels.ops.attention.dsv4.wo_a import (
     can_use_fused_wo_a,
@@ -578,6 +579,10 @@ def _apply_wo_a_bf16_matmul(
             if fuse_mxfp8_quant:
                 return Mxfp8SwizzledInput(*wo_a_bf16_small_batch_mxfp8(o, wo_a))
             return wo_a_bf16_small_batch(o, wo_a)
+        if hip_decode_verify:
+            y = _hip.wo_a_verify_matmul(o, wo_a, emit_fp8)
+            if y is not None:
+                return y
         return _wo_a_bf16_bmm_token_major(o, wo_a)
     # The DSpark draft runs its block as target verify past 384 rows and with any
     # group count (8 without attention TP); the strided bmm still matches einsum.
@@ -2524,7 +2529,15 @@ class MQALayer(MqaAttentionBase):
             q_lora, q_for_wqb = self._normalize_q_lora(q_lora)
             if _is_hip:
                 q, q_lora, fuse_q_rope = _hip.compute_q_b(
-                    self, q_lora, q_for_wqb, positions, q_out, unified, use_cp
+                    self,
+                    q_lora,
+                    q_for_wqb,
+                    positions,
+                    q_out,
+                    unified,
+                    use_cp,
+                    forward_batch=forward_batch,
+                    attn_backend=attn_backend,
                 )
             else:
                 q = self._compute_q_b(q_for_wqb, positions, q_out)
@@ -2580,8 +2593,13 @@ class MQALayer(MqaAttentionBase):
                 )
                 kv = None
             elif in_replay_tail_graph():
-                assert not fuse_q_rope
-                bcg_tail_kv_store(self, x_linear, positions, qkv_a)
+                bcg_tail_kv_store(
+                    self,
+                    x_linear,
+                    positions,
+                    qkv_a,
+                    q if _is_hip and fuse_q_rope else None,
+                )
                 kv = None
             else:
                 self._compute_kv_to_cache(
@@ -2590,7 +2608,11 @@ class MQALayer(MqaAttentionBase):
                     forward_batch,
                     attn_backend,
                     qkv_a=qkv_a,
-                    q_rope=q if fuse_q_rope else None,
+                    q_rope=(
+                        (q.q_rope if isinstance(q, OpusPackedQ) else q)
+                        if fuse_q_rope
+                        else None
+                    ),
                 )
                 kv = None
 
@@ -4212,6 +4234,7 @@ class DeepseekV4Model(nn.Module):
         # mHC assumes full token rows per rank; LayerNorm SP needs its own path.
         assert not get_forward().sp_active
         state = mhc.HcState(hidden_states)
+        fused_step = _is_hip and _hip.fused_boundary_this_step(forward_batch)
         if _is_cuda:
             residual_batch.start(forward_batch)
             hidden_states = residual_batch.set_written(state, forward_batch)
@@ -4241,7 +4264,7 @@ class DeepseekV4Model(nn.Module):
             if tail is not None and i == self.late_layer_start:
                 if self.tail_writes_source_kv:
                     source = self.layers[i]
-                    if _is_hip and source.hc_boundary_fused:
+                    if fused_step and source.hc_boundary_fused:
                         # The previous FFN hc_post has not run yet, so run it here too.
                         source_x = fused_boundary_attn_input(source, state)
                     else:
@@ -4379,7 +4402,7 @@ class DeepseekV4Model(nn.Module):
                         input_ids_global=input_ids_global,
                     )
                 else:
-                    if _is_hip and self.layers[i].hc_boundary_fused:
+                    if fused_step and self.layers[i].hc_boundary_fused:
                         state = forward_layer_fused_boundary(
                             self,
                             i,
