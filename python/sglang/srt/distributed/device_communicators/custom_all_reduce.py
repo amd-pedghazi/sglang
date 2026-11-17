@@ -433,9 +433,10 @@ def dispatch_custom_allreduce(
 
             logger.info("[AR] Using AiterCustomAllreduce (AMD default)")
             tms_cudagraph = envs.SGLANG_MEMORY_SAVER_CUDA_GRAPH.get()
+            copy_in = envs.SGLANG_AITER_CAPTURE_COPY_IN.get()
             return partial(
                 AiterCustomAllreduce,
-                enable_register_for_capturing=not tms_cudagraph,
+                enable_register_for_capturing=not (tms_cudagraph or copy_in),
             )
         except ImportError as e:
             logger.warning(
