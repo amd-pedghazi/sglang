@@ -25,6 +25,14 @@ def _default_hip() -> bool:
         return False
 
 
+def _mega_or_mono_runtime() -> bool:
+    """On with either vendor's megakernel runtime switch."""
+    return (
+        envs.SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get()
+        or envs.SGLANG_ENABLE_AMD_MONO_RUNTIME_OPTIMIZATION.get()
+    )
+
+
 _NON_UTF8_PREFIX = "base64:"
 
 
@@ -284,6 +292,8 @@ class Envs:
     SGLANG_ENABLE_TORCH_INFERENCE_MODE = EnvBool(False)
     # Explicit child values override this default for megakernel runtime optimizations.
     SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION = EnvBool(False)
+    # The same for the runtime optimizations accompanying AMD monokernels (sgl-amd-mono).
+    SGLANG_ENABLE_AMD_MONO_RUNTIME_OPTIMIZATION = EnvBool(False)
 
     # ===================================================================
     # Model configuration, discovery, and weight loading
@@ -589,8 +599,33 @@ class Envs:
     # the NCCL ring. Only taken when the group's communicator has a multicast
     # plane; off, or no such plane, keeps the NCCL all-gather.
     SGLANG_DSPARK_NVLINK_VOCAB_GATHER = EnvBool(True)
+    # Keep the target-verify logits on the TP vocab shards and accept on them (shard
+    # keys for greedy rows, the sharded chain rule for temperature rows), instead of
+    # all-gathering the full logits every verify step; other batches gather as before.
+    SGLANG_DSPARK_TARGET_VOCAB_SHARDS = EnvBool(False)
     SGLANG_DSPARK_ENABLE_MULTI_STREAM = EnvBool(True)
     SGLANG_DSPARK_CONFIDENCE_RELAY_LAG_STEPS = EnvInt(2)
+    # DSpark static verify: verify graphs also captured without the epilogue, for the
+    # steps that skip it (sampling, grammar)
+    SGLANG_OPT_DSV41_DSPARK_NOTAIL_VERIFY_GRAPH = EnvBool(
+        SGLANG_ENABLE_AMD_MONO_RUNTIME_OPTIMIZATION.get
+    )
+    # DSpark Markov bias GEMV in the launch that adds it (near ties can draft differently)
+    SGLANG_OPT_DSV41_DSPARK_MARKOV_FUSED_BIAS = EnvBool(
+        SGLANG_ENABLE_AMD_MONO_RUNTIME_OPTIMIZATION.get
+    )
+    # each Markov step's launch picks the previous step's tokens; one TP sync a block
+    SGLANG_OPT_DSV41_DSPARK_MARKOV_FOLD = EnvBool(
+        SGLANG_ENABLE_AMD_MONO_RUNTIME_OPTIMIZATION.get
+    )
+    # ROCm speculative verify: temperature, softmax and top-p over many blocks a row
+    SGLANG_OPT_ROCM_SPEC_SOFTMAX_TOP_P = EnvBool(
+        SGLANG_ENABLE_AMD_MONO_RUNTIME_OPTIMIZATION.get
+    )
+    # ROCm DSpark sampling accept: the classic chain over many blocks a request.
+    SGLANG_OPT_ROCM_DSPARK_CHAIN_REJECTION = EnvBool(
+        SGLANG_ENABLE_AMD_MONO_RUNTIME_OPTIMIZATION.get
+    )
     # Static verify graphs with bs in [MIN_BS, MAX_BS] (MAX_BS 0: unbounded) run the
     # greedy accept and its bookkeeping as one kernel.
     SGLANG_DSPARK_FUSED_ACCEPT_TAIL = EnvBool(
@@ -610,14 +645,10 @@ class Envs:
     )
     # DSpark static verify: the verify graph scatters new seq lens and the bonus into
     # the FutureMap's slots; the host skips those scatters for folded accepts.
-    SGLANG_OPT_DSV41_DSPARK_POST_FOLD = EnvBool(
-        SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get
-    )
+    SGLANG_OPT_DSV41_DSPARK_POST_FOLD = EnvBool(_mega_or_mono_runtime)
     # DSpark target verify: a pre-planned replay skips re-copying input_ids / positions
     # the plan-time load already copied from the same tensors.
-    SGLANG_OPT_DSV41_DSPARK_SKIP_PREFILLED_INPUTS = EnvBool(
-        SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get
-    )
+    SGLANG_OPT_DSV41_DSPARK_SKIP_PREFILLED_INPUTS = EnvBool(_mega_or_mono_runtime)
     # DSpark: draw the simulated acceptance length (and the sim bonus seed) before the
     # draft launch instead of between the draft and the target verify.
     SGLANG_OPT_DSV41_DSPARK_SIM_DRAW_AHEAD = EnvBool(False)
@@ -1051,6 +1082,17 @@ class Envs:
     # AMD, ROCm, and AITER
     # ===================================================================
     SGLANG_USE_AITER = EnvBool(False)
+    # With ROCM_QUICK_REDUCE_QUANTIZATION=INT4 on gfx950, run QuickReduce with
+    # aiter's FlyDSL INT4 kernel instead of the HIP INT4 kernel.
+    SGLANG_USE_AITER_FLYDSL_QUICK_REDUCE = EnvBool(False)
+    # 0 keeps aiter's default super_tile; aiter validates nonzero values.
+    SGLANG_AITER_FLYDSL_QUICK_REDUCE_SUPER_TILE = EnvInt(0)
+    # Run QuickReduce ahead of the custom all-reduce for payloads of at least this many
+    # bytes (0 = off: the custom all-reduce goes first, as before). Inside the window the
+    # codec's own minimum size does not apply.
+    SGLANG_QUICK_REDUCE_FIRST_MIN_BYTES = EnvInt(0)
+    # Upper end of that window in bytes; 0 = QuickReduce's max size.
+    SGLANG_QUICK_REDUCE_FIRST_MAX_BYTES = EnvInt(0)
     # Set by someone bisecting a numerical or performance regression to an
     # online-FP8 linear on gfx1250, to take the Triton tile out of the picture
     # without rebuilding. The tile is on by default because hipBLASLt ships no
@@ -2025,6 +2067,10 @@ class Envs:
     # Prefill-graph shapes of at least this many tokens run the tail from the tail
     # graphs in a break (measured crossover 1536-2048 tokens on GB300 TP4).
     SGLANG_DSV4_DECODER_TAIL_GRAPH_MIN_PREFILL_TOKENS = EnvInt(2048)
+    # ROCm breakable prefill graphs: keep the tail as on CUDA, captured as the tail
+    # block below that threshold and in the break over each request's exact tail
+    # rows, from the tail graphs, at or above it. Off, ROCm keeps no tail in them.
+    SGLANG_OPT_HIP_PREFILL_GRAPH_EXACT_TAIL = EnvBool(False)
     # Paged KV layout of the DeepSeek-V4 family pools: "v4" (584 B/token, every
     # GPU), "v41" (the SM100 FlashMLA V4.1 formats: 528 B fp8 SWA cache, fp8 or
     # fp4 compressed caches), "v41_new" (the same bytes interleaved per token, for
@@ -2078,7 +2124,15 @@ class Envs:
     # are read only by _resolve_engram_config.
     SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE = EnvBool(False)
     SGLANG_OPT_ENGRAM_EXTEND_HASH = EnvBool(False)
+    # Single-pass Mega-mHC prefill. SM100 uses DeepGEMM; gfx950 uses aiter
+    # flydsl_mega_mhc (ROCm/aiter#6179). Off by default.
     SGLANG_OPT_DSV41_MEGA_MHC_PREFILL = EnvBool(False)
+    # With SGLANG_OPT_DSV41_MEGA_MHC_PREFILL and --enable-amd-monokernel, gfx950
+    # Mega-mHC also runs the decode and verify steps the monokernel does not serve.
+    SGLANG_OPT_DSV41_MEGA_MHC_DECODE = EnvBool(False)
+    # With SGLANG_OPT_DSV41_MEGA_MHC_PREFILL, gfx950 Mega-mHC also runs the seams of the
+    # DSpark draft stages that SGLang serves. Off by default.
+    SGLANG_OPT_DSV41_MEGA_MHC_DRAFT = EnvBool(False)
     # Deprecated for --engram-config "replication".
     SGLANG_DSV41_ENGRAM_HOST_TABLE_LAYOUT = EnvStr("per_rank")
     # Scheduler-side staging of shared host-table rows on GPUs without ATS
@@ -2086,6 +2140,10 @@ class Envs:
     SGLANG_OPT_DSV41_ENGRAM_HOST_STAGING = EnvBool(False)
     # Deprecated for --engram-config "lookup".
     SGLANG_OPT_DSV41_ENGRAM_PEER_SHARDS = EnvBool(False)
+    # HIP eager prefill with TP > 1 and whole hash columns per rank: all-gather each
+    # rank's own columns' rows in their stored fp8 form instead of all-reducing
+    # zero-filled bf16 rows. Bitwise the same lookup.
+    SGLANG_OPT_HIP_ENGRAM_ALL_GATHER = EnvBool(False)
 
     # Kernels and indexer
     SGLANG_OPT_DEEPGEMM_HC_PRENORM = EnvBool(True)
@@ -2120,6 +2178,11 @@ class Envs:
     # gfx950 DeepSeek-V4.1 prefill: attend with aiter's OPUS sparse kernel over a bf16
     # dequant of the chunk's SWA and compressed history, instead of the decode kernel.
     SGLANG_OPT_HIP_OPUS_SPARSE_PREFILL = EnvBool(False)
+    # With the above: gather the chunk's rows as fp8 (unit scale, RoPE cast to fp8 for
+    # P*V) plus their bf16 RoPE for QK^T, instead of the bf16 dequant, and attend with
+    # aiter's fp8 OPUS kernel. Applies to the V4 cache layout and at most 32 local
+    # heads; other layers keep bf16.
+    SGLANG_OPT_HIP_OPUS_FP8_PREFILL = EnvBool(False)
     # DSpark draft block on the HIP radix backend: build the attention metadata inside the
     # draft CUDA graph from the raw inputs instead of eagerly before every replay.
     SGLANG_HIP_DSPARK_DRAFT_RAW_METADATA = EnvBool(_default_hip)
@@ -2142,24 +2205,16 @@ class Envs:
     SGLANG_OPT_FUSE_WQA_WKV = EnvBool(True)
     # DSpark decode: build the verify window and the draft anchor column in one
     # launch instead of two adds, assign_extend_cache_locs and a copy.
-    SGLANG_OPT_DSV41_DSPARK_PREPARE_INPUTS_ONCE = EnvBool(
-        SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get
-    )
+    SGLANG_OPT_DSV41_DSPARK_PREPARE_INPUTS_ONCE = EnvBool(_mega_or_mono_runtime)
     # DSpark folded draft: the draft graph's tail writes [anchor | draft tokens]
     # into the sampler's own buffer, so the step skips its eager concat.
-    SGLANG_OPT_DSV41_DSPARK_MID_FOLD = EnvBool(
-        SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get
-    )
+    SGLANG_OPT_DSV41_DSPARK_MID_FOLD = EnvBool(_mega_or_mono_runtime)
     # DSpark static verify: run the target verify runner's metadata prep through the
     # metadata glue graph where its backend declares the prep host-free.
-    SGLANG_OPT_DSV41_TARGET_VERIFY_METADATA_GLUE = EnvBool(
-        SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get
-    )
+    SGLANG_OPT_DSV41_TARGET_VERIFY_METADATA_GLUE = EnvBool(_mega_or_mono_runtime)
     # DSpark static verify: build the target verify metadata on a side stream beside the
     # draft graph (needs the glue switch above).
-    SGLANG_OPT_DSV41_TARGET_METADATA_EARLY = EnvBool(
-        SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get
-    )
+    SGLANG_OPT_DSV41_TARGET_METADATA_EARLY = EnvBool(_mega_or_mono_runtime)
     # Decode / verify graph replays whose metadata glue graph is captured skip the
     # replay ForwardBatch view (the graph reads slots and buffers by address).
     SGLANG_OPT_SKIP_GLUED_REPLAY_VIEW = EnvBool(

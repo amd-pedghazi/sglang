@@ -9,6 +9,7 @@ from sglang.kernels.ops.speculative.dspark.blockwise_rejection import (
 from sglang.srt.configs.hybrid_arch import mambaish_config
 from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import get_dp_tp_group
+from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.logprob_processor import compute_spec_logprobs
 from sglang.srt.lora.layers import unwrap_lora_layer
 from sglang.srt.managers.schedule_batch import ScheduleBatch
@@ -74,11 +75,18 @@ from sglang.srt.speculative.dspark_components.dspark_planner import (
 from sglang.srt.speculative.dspark_components.dspark_sampling_accept_graph import (
     DsparkSamplingAcceptGraph,
 )
+from sglang.srt.speculative.dspark_components.dspark_target_shards import (
+    keeps_target_shards,
+    sampling_region_allowed,
+    target_shard_of,
+    target_shards_refusal,
+)
 from sglang.srt.speculative.dspark_components.dspark_verify import (
     AcceptOuts,
     CommitInjectCtx,
     DsparkVerifyEpilogue,
     TargetVerifyExecutor,
+    _accepts_on_shards,
     target_model_type,
     verify_logits_adjustments_are_noop,
 )
@@ -480,9 +488,12 @@ class DSparkWorkerV2(BaseSpecWorker):
                     ),
                 ),
             )
-            self.model_runner.capture_tail_hooks.append(
-                self._verify_epilogue.capture_hook
+            tail_hooks = (
+                self.model_runner.optional_capture_tail_hooks
+                if envs.SGLANG_OPT_DSV41_DSPARK_NOTAIL_VERIFY_GRAPH.get()
+                else self.model_runner.capture_tail_hooks
             )
+            tail_hooks.append(self._verify_epilogue.capture_hook)
             if (
                 envs.SGLANG_OPT_DSV41_SAMPLING_ACCEPT_GRAPH.get()
                 and static_epilogue_supported
@@ -543,6 +554,7 @@ class DSparkWorkerV2(BaseSpecWorker):
             device=self.device,
             simulate_acc_len=self._simulate_acc_len,
         )
+        self._target_shard = self._keep_target_verify_shards()
 
         if self._is_pd_prefill and not self._draft_is_moe:
             self.draft_model.prune_to_ctx_kv_injection()
@@ -583,6 +595,54 @@ class DSparkWorkerV2(BaseSpecWorker):
             num_correct_drafts=accept.correct_len + accept.cap_trim_lens,
             num_graded_drafts=num_graded_drafts,
         )
+
+    def _keep_target_verify_shards(self):
+        """SGLANG_DSPARK_TARGET_VOCAB_SHARDS, before the target's verify graphs are
+        captured: the verify logits stay on this rank's vocabulary shard. Returns the
+        shard, or None for today's gathered logits."""
+        if not envs.SGLANG_DSPARK_TARGET_VOCAB_SHARDS.get():
+            return None
+        model = self.target_worker.model_runner.model
+        processors = [m for m in model.modules() if isinstance(m, LogitsProcessor)]
+        lm_head = getattr(model, "lm_head", None)
+        if len(processors) != 1 or lm_head is None:
+            refusal = f"{len(processors)} logits processors or no lm_head"
+        else:
+            shard = target_shard_of(lm_head, processors[0].vocab_size)
+            markov_head = self.draft_model.markov_head
+            observers = self._observers
+            refusal = target_shards_refusal(
+                switch=True,
+                tp_size=get_parallel().tp_size,
+                model_type=target_model_type(self.target_worker),
+                num_logits_processors=len(processors),
+                simulate_acc_len=self._simulate_acc_len,
+                observers_read_logits=bool(
+                    getattr(observers, "_sts_collect_path", "")
+                    or getattr(observers, "_block_accept_recorder", None) is not None
+                    or envs.SGLANG_DSPARK_DEBUG_CONFIDENCE_METRICS.get()
+                ),
+                local_width=int(lm_head.num_embeddings_per_partition),
+                shard=shard,
+                draft_shard=(
+                    markov_head.vocab_shard
+                    if self._sharded_accept and markov_head is not None
+                    else None
+                ),
+            )
+        if refusal is not None:
+            if self._target_tp_rank == 0:
+                logger.warning("DSpark target vocab shards off: %s.", refusal)
+            return None
+        processors[0].defer_verify_gather = True
+        self._verify_executor.target_logits_processor = processors[0]
+        if self._verify_epilogue is not None:
+            self._verify_epilogue.use_target_shards(shard, get_parallel().tp_group)
+        if self._target_tp_rank == 0:
+            logger.info(
+                "DSpark verify keeps the target logits on the vocab shards: %s", shard
+            )
+        return shard
 
     def _resolve_target_embed_tokens(self, target_model):
         if hasattr(target_model, "get_input_embeddings"):
@@ -1131,6 +1191,9 @@ class DSparkWorkerV2(BaseSpecWorker):
             )
             and not batch.has_grammar
         )
+        self.model_runner.want_optional_tail = (
+            fold_eligible or self._sampling_accept_graph is not None
+        )
         if not self._sim_draw_ahead:
             self._verify_executor.begin_simulated_step()
             if fold_eligible and self._verify_executor.verify_epilogue.simulate_fold:
@@ -1142,6 +1205,23 @@ class DSparkWorkerV2(BaseSpecWorker):
                         else simulate_bonus_sampling_info.temperatures[:bs]
                     ),
                 )
+        # Decided before the verify: a step that cannot accept on the vocabulary shards
+        # gathers the full logits ahead of the logit adjustments inside the verify.
+        keep_target_shards = self._target_shard is not None and keeps_target_shards(
+            shard=self._target_shard,
+            has_grammar=batch.has_grammar,
+            return_logprob=batch.return_logprob,
+            sampling_info=sampling_info,
+            adjustments_noop=verify_logits_adjustments_are_noop(sampling_info),
+            sampling_on_shards=(
+                sampling_info is not None
+                and _accepts_on_shards(
+                    draft_block,
+                    sampling_info,
+                    get_spec().speculative_use_block_verification,
+                )
+            ),
+        )
         with self._observers.segment(InfoSegment.TARGET_VERIFY):
             if run_compact:
                 target_verify, hidden_strided = self._verify_executor.run_compact(
@@ -1154,6 +1234,7 @@ class DSparkWorkerV2(BaseSpecWorker):
                     sampling_info=sampling_info,
                     verify_window=verify_window,
                     inject_gate=fold_eligible,
+                    keep_target_shards=keep_target_shards,
                 )
             else:
                 if (
@@ -1167,6 +1248,7 @@ class DSparkWorkerV2(BaseSpecWorker):
                     verify_ids_2d=verify_ids_2d,
                     verify_window=verify_window,
                     sampling_info=sampling_info,
+                    keep_target_shards=keep_target_shards,
                 )
                 hidden_strided = None
         logits_output = target_verify.logits_output
@@ -1234,6 +1316,8 @@ class DSparkWorkerV2(BaseSpecWorker):
                 prefix_lens=prefix_lens,
                 draft_tokens=draft_tokens,
                 simulate_bonus_sampling_info=simulate_bonus_sampling_info,
+                target_shard=self._target_shard if keep_target_shards else None,
+                tp_group=get_parallel().tp_group if keep_target_shards else None,
             )
         if proposal.acceptance_features is not None and self._simulate_acc_len <= 0:
             self._observe_acceptance(
@@ -1418,6 +1502,7 @@ class DSparkWorkerV2(BaseSpecWorker):
                 or simulate_bonus_sampling_info is sampling_info
             )
             and not batch.has_grammar
+            and sampling_region_allowed(self._target_shard)
         )
 
     def _future_relay_in_graph(self, *, run_compact: bool, folded_accept: bool):
