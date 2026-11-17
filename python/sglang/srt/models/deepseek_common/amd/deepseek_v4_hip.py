@@ -8,7 +8,12 @@ from typing import Optional, Tuple
 
 import torch
 
+from sglang.kernels.ops.attention.dsv4.opus_sparse_prefill_hip import OpusPackedQ
 from sglang.kernels.ops.layernorm.mhc_post_split_h import mhc_post_split_h
+from sglang.kernels.ops.quantization.mxfp8_amd_gfx95 import (
+    Fp8GridActivation,
+    Mxfp8Activation,
+)
 from sglang.srt.batch_invariant_ops import is_batch_invariant_mode_enabled
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.hip_flash_mla import (
@@ -27,11 +32,12 @@ from sglang.srt.models.deepseek_common.amd.deepseek_v4_wo_a_fp8 import (
     is_wo_a_fp8_block32_supported,
     wo_a_fp8_block,
 )
-from sglang.srt.runtime_context import get_exec
+from sglang.srt.runtime_context import get_context, get_exec
 from sglang.srt.utils import is_gfx95_supported
 
 live_rows = gfx95_dense.live_rows
 wo_a_fp8_grid_matmul = gfx95_dense.wo_a_fp8_grid_matmul
+wo_a_verify_matmul = gfx95_dense.wo_a_verify_matmul
 wo_b_emits_mxfp8 = gfx95_dense.wo_b_emits_mxfp8
 
 _is_gfx95_supported = is_gfx95_supported()
@@ -116,6 +122,32 @@ def wq_b_unroped(attn, q) -> torch.Tensor:
     return q.view(-1, attn.n_local_heads, attn.head_dim)
 
 
+def wq_b_packed_for_opus(attn, q, forward_batch, attn_backend) -> Optional[OpusPackedQ]:
+    """wq_b_unroped as the fp8 OPUS prefill kernel's query pair, written by wq_b's GEMM
+    itself, where this layer's attention runs that kernel; None elsewhere."""
+    takes = getattr(attn_backend, "opus_fp8_takes_packed_q", None)
+    rows = q.x if isinstance(q, Fp8GridActivation) else q
+    rows = rows.q if isinstance(rows, Mxfp8Activation) else rows
+    rows = rows[0] if isinstance(rows, tuple) else rows
+    if (
+        takes is None
+        or attn.use_mega_attention
+        or is_in_breakable_cuda_graph()
+        or not takes(
+            rows.shape[0],
+            attn.n_local_heads,
+            attn.layer_id,
+            forward_batch,
+            attn.compress_ratio,
+        )
+    ):
+        return None
+    from sglang.srt.layers.quantization.fp8_hip import apply_dense_packed_q
+
+    packed = apply_dense_packed_q(attn.wq_b.quant_method, attn.wq_b, q)
+    return None if packed is None else OpusPackedQ(*packed)
+
+
 def compute_q_b(
     attn,
     q_lora: torch.Tensor,
@@ -124,15 +156,22 @@ def compute_q_b(
     q_out: Optional[torch.Tensor],
     unified: bool,
     use_cp: bool,
+    forward_batch=None,
+    attn_backend=None,
 ):
     """attn._compute_q_b(q_for_wqb, positions, q_out) as (q, the q_lora the indexer reads,
     whether the K norm-rope-store launch ropes q). The indexer takes the fused operand:
-    its wq_b would re-round onto the same grid."""
+    its wq_b would re-round onto the same grid. With forward_batch / attn_backend, q is an
+    OpusPackedQ where the layer's attention takes one (wq_b_packed_for_opus)."""
     fuse_q_rope = _is_gfx95_supported and fuses_q_rope_into_k_store(
         attn, q_out, unified=unified, use_cp=use_cp
     )
     if fuse_q_rope:
-        q = wq_b_unroped(attn, q_for_wqb)
+        q = None
+        if forward_batch is not None:
+            q = wq_b_packed_for_opus(attn, q_for_wqb, forward_batch, attn_backend)
+        if q is None:
+            q = wq_b_unroped(attn, q_for_wqb)
     else:
         q = attn._compute_q_b(q_for_wqb, positions, q_out)
     return q, q_for_wqb, fuse_q_rope
@@ -182,9 +221,35 @@ def init_decoder_layer(layer, quant_config) -> None:
     )
     layer._wqkv_a_native_consumer_checked = False
     layer._wqkv_a_native_consumer = False
+    # Whether the layer can take the fused boundary; fused_boundary_this_step picks
+    # the step's path. The AMD monokernel checks this at attach.
     layer.hc_boundary_fused = (
         _is_gfx95_supported and layer.hc_pre_from_prev_sublayer and layer.hc_mult == 4
     )
+
+
+def _amd_monokernel_enabled() -> bool:
+    # the model also runs without a server's config (tools, unit tests)
+    if not get_context().is_config_namespace_published("exec"):
+        return False
+    return get_exec().kernel.enable_amd_monokernel
+
+
+def fused_boundary_this_step(forward_batch) -> bool:
+    """Whether this step's hc_boundary_fused layers take the fused mHC boundary.
+
+    Mega-mHC runs the seam from forward_hc_pre_from_prev instead; running both would
+    apply the same post twice. It replaces the fused boundary on every step, except
+    under the AMD monokernel, where only prefill takes it unless
+    SGLANG_OPT_DSV41_MEGA_MHC_DECODE is set: the monokernel's kernels follow the fused
+    boundary, so by default the decode steps it leaves to SGLang keep that path. The
+    steps it serves run its own forward and never reach this choice.
+    """
+    if not envs.SGLANG_OPT_DSV41_MEGA_MHC_PREFILL.get():
+        return True
+    if forward_batch.forward_mode.is_extend_without_speculative():
+        return False
+    return _amd_monokernel_enabled() and not envs.SGLANG_OPT_DSV41_MEGA_MHC_DECODE.get()
 
 
 def hc_post(cfg, x, residual, post, comb) -> Optional[torch.Tensor]:
