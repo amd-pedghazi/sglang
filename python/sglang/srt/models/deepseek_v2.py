@@ -111,6 +111,7 @@ from sglang.srt.layers.linear import (
     RowParallelLinear,
 )
 from sglang.srt.layers.logits_processor import LogitsProcessor
+from sglang.srt.layers.moe import attlas_route_a as _attlas_route_a
 from sglang.srt.layers.moe import (
     get_moe_a2a_backend,
     get_moe_runner_backend,
@@ -1031,6 +1032,9 @@ class DeepseekV2MoE(nn.Module):
 
             bind_gluon_moe_backend(self, GlmMxfp4GluonMoeBackend())
 
+        if _attlas_route_a.enabled():
+            _attlas_route_a.prepare(torch.device("cuda", torch.cuda.current_device()))
+
     def get_moe_weights(self):
         # EPLB only rebalances physical routed experts. Fused shared expert
         # slots live after each rank's routed slots and must stay stable.
@@ -1092,6 +1096,11 @@ class DeepseekV2MoE(nn.Module):
             if forward_batch is not None
             else None
         )
+        if _attlas_route_a.enabled():
+            _attlas_route_a.set_decode(
+                forward_batch is not None
+                and (forward_batch.forward_mode.is_decode() or forward_batch.forward_mode.is_target_verify())
+            )
         if should_use_gluon_moe(self):
             output = forward_gluon_moe(
                 self,
@@ -1235,6 +1244,8 @@ class DeepseekV2MoE(nn.Module):
                     input_ids_global,
                 )
             else:
+                if _attlas_route_a.enabled():
+                    _attlas_route_a.stage(hidden_states)
                 topk_output = self.topk(
                     hidden_states,
                     router_logits,
@@ -1424,6 +1435,8 @@ class DeepseekV2MoE(nn.Module):
                     input_ids_global,
                 )
             else:
+                if _attlas_route_a.enabled():
+                    _attlas_route_a.stage(hidden_states)
                 topk_output = self.topk(
                     hidden_states,
                     router_logits,
@@ -1471,11 +1484,15 @@ class DeepseekV2MoE(nn.Module):
                 topk_output,
                 pre_quant_input=pre_quant_input,
             )
+            if _attlas_route_a.enabled():
+                _attlas_route_a.clear()
         else:
             final_hidden_states = self.experts(
                 hidden_states,
                 topk_output,
             )
+            if _attlas_route_a.enabled():
+                _attlas_route_a.clear()
         if (
             not _is_cuda
             and not _is_musa
