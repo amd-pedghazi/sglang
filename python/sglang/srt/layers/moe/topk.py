@@ -2832,6 +2832,10 @@ def _post_process_topk_ids(
     return topk_ids, topk_weights, recorder_topk_ids
 
 
+def use_per_rank_shared_slots_for_route_a(num_shared_topk_slots: int) -> bool:
+    return has_per_rank_fused_shared_slots(num_shared_topk_slots)
+
+
 def select_experts(
     hidden_states: torch.Tensor,
     router_logits: torch.Tensor,
@@ -3032,21 +3036,65 @@ def select_experts(
                 ):
                     # the ROCm decode gate writes the aiter shared columns itself
                     _packed_kwargs["num_shared_append"] = num_shared_topk_slots
-            topk_weights, topk_ids = _biased_topk(
-                hidden_states=hidden_states,
-                gating_output=router_logits,
-                correction_bias=correction_bias,
-                topk=top_k_for_gate,
-                renormalize=renormalize,
-                scoring_func=scoring_func,
-                num_fused_shared_experts=num_shared_topk_slots_for_gate,
-                routed_scaling_factor=routed_scaling_factor,
-                num_token_non_padded=num_token_non_padded,
-                expert_location_dispatch_info=expert_location_dispatch_info,
-                apply_routed_scaling_factor_on_output=apply_routed_scaling_factor_on_output,
-                **_packed_kwargs,
-            )
-            padded_rows_masked = _fused_gate_masks_padded_rows(scoring_func)
+            # attlas_1120 item A (SGLANG_ATTLAS_ROUTE_A=1): one launch for top-k + shared slot + sort + MXFP8
+            # quant above 256 rows; None falls back to the router below.
+            _route_a = None
+            from sglang.srt.layers.moe import attlas_route_a
+
+            if attlas_route_a.enabled():
+                _route_a_why = [name for name, bad in (
+                    ("no aiter", not _use_aiter), ("scoring", scoring_func != "sqrtsoftplus"),
+                    ("shared slots", num_shared_topk_slots != 1),
+                    ("per-rank shared slots", use_per_rank_shared_slots_for_route_a(num_shared_topk_slots)),
+                    ("packed ids", packed_topk is not None), ("split-K partials", router_logits_partials is not None),
+                    ("routing overridden", routing_overridden),
+                    ("expert remapping", expert_location_dispatch_info is not None and is_expert_remapping_enabled()),
+                ) if bad]
+                if _route_a_why:
+                    attlas_route_a.note_skip(hidden_states.shape[0], _route_a_why)
+                else:
+                    _route_a = attlas_route_a.try_route(
+                        hidden_states,
+                        router_logits,
+                        correction_bias,
+                        renormalize,
+                        routed_scaling_factor,
+                        topk_config.fused_shared_experts_scaling_factor or 1.0,
+                        num_token_non_padded,
+                        ref_fn=lambda: _biased_topk(
+                            hidden_states=hidden_states,
+                            gating_output=router_logits,
+                            correction_bias=correction_bias,
+                            topk=top_k_for_gate,
+                            renormalize=renormalize,
+                            scoring_func=scoring_func,
+                            num_fused_shared_experts=num_shared_topk_slots_for_gate,
+                            routed_scaling_factor=routed_scaling_factor,
+                            num_token_non_padded=num_token_non_padded,
+                            expert_location_dispatch_info=expert_location_dispatch_info,
+                            apply_routed_scaling_factor_on_output=apply_routed_scaling_factor_on_output,
+                            **_packed_kwargs,
+                        ),
+                    )
+            if _route_a is not None:
+                topk_weights, topk_ids = _route_a  # [M, top_k]: the shared column is written
+                padded_rows_masked = num_token_non_padded is not None
+            else:
+                topk_weights, topk_ids = _biased_topk(
+                    hidden_states=hidden_states,
+                    gating_output=router_logits,
+                    correction_bias=correction_bias,
+                    topk=top_k_for_gate,
+                    renormalize=renormalize,
+                    scoring_func=scoring_func,
+                    num_fused_shared_experts=num_shared_topk_slots_for_gate,
+                    routed_scaling_factor=routed_scaling_factor,
+                    num_token_non_padded=num_token_non_padded,
+                    expert_location_dispatch_info=expert_location_dispatch_info,
+                    apply_routed_scaling_factor_on_output=apply_routed_scaling_factor_on_output,
+                    **_packed_kwargs,
+                )
+                padded_rows_masked = _fused_gate_masks_padded_rows(scoring_func)
         elif (
             topk_config.runner_backend is not None
             and topk_config.runner_backend.is_flashinfer_trtllm_routed()
