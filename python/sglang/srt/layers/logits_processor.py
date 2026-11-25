@@ -1181,6 +1181,10 @@ class LogitsProcessor(nn.Module):
             return self._gather_softcap_fused(
                 logits, logits_metadata, use_logits_buffer
             )
+        if self._defers_plain_verify_gather(
+            logits, local_hidden_states, lm_head, logits_metadata
+        ):
+            return logits
 
         used_tp_lm_head_all_to_all = False
         if self.do_tensor_parallel_all_gather:
@@ -1255,12 +1259,38 @@ class LogitsProcessor(nn.Module):
             )
         )
 
+    def _defers_plain_verify_gather(
+        self,
+        logits: torch.Tensor,
+        local_hidden_states: torch.Tensor,
+        lm_head: VocabParallelEmbedding,
+        logits_metadata: LogitsMetadata,
+    ) -> bool:
+        """A target verify without softcapping whose plain TP gather the speculative
+        worker does itself (DSpark accepts on the vocabulary shards)."""
+        return (
+            self.defer_verify_gather
+            and not self.final_logit_softcapping
+            and logits_metadata.forward_mode.is_target_verify()
+            and self.do_tensor_parallel_all_gather
+            and not self.use_attn_tp_group
+            and not self.do_tensor_parallel_all_gather_dp_attn
+            and not self._can_use_tp_lm_head_all_to_all(
+                logits, local_hidden_states, lm_head, logits_metadata
+            )
+        )
+
     def is_deferred_shard(self, logits: torch.Tensor) -> bool:
         return self.defer_verify_gather and logits.shape[-1] < self.vocab_size
 
     def finish_deferred_gather(self, logits: torch.Tensor) -> torch.Tensor:
-        """Full softcapped logits from a target-verify vocab shard."""
-        return self._gather_softcap_fused(logits, None, use_buffer=False)
+        """Full logits from a target-verify vocab shard: softcapped, or without
+        softcapping the stock gather and FP32 cast."""
+        if self.final_logit_softcapping:
+            return self._gather_softcap_fused(logits, None, use_buffer=False)
+        return self._copy_logits_to_buffer(
+            self._logits_gatherer(logits), None, use_buffer=False
+        )
 
     def deferred_argmax(self, logits: torch.Tensor) -> torch.Tensor:
         """``argmax`` of the full softcapped logits from a target-verify vocab

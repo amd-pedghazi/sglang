@@ -34,6 +34,7 @@ _SPLIT_ACCEPT = (
 )
 
 _is_npu = is_npu()
+_is_hip = is_hip()
 
 if _is_npu:
     from sgl_kernel_npu.sample import chain_speculative_sampling_triton
@@ -203,6 +204,15 @@ def _accept_sampling_core(
     if block_verification:
         # Startup validation rejects NPU, whose sampler has no block mode.
         sampling_fn = partial(sampling_fn, block_verification=True)
+    elif _is_hip and envs.SGLANG_OPT_ROCM_DSPARK_CHAIN_REJECTION.get():
+        from sglang.kernels.ops.speculative.chain_rejection import (
+            chain_rejection_sampling,
+            chain_rejection_supported,
+        )
+
+        # each request's vocabulary over many blocks, not one
+        if chain_rejection_supported(target_probs, draft_probs):
+            sampling_fn = chain_rejection_sampling
     sampling_fn(
         predicts=predicts,
         accept_index=accept_index,
@@ -342,6 +352,8 @@ class SoftmaxTemp:
             return cls.torch(*args, **kwargs)
         if _flashinfer_softmax is not None:
             return cls.flashinfer(*args, **kwargs)
+        if is_hip() and envs.SGLANG_OPT_ROCM_SPEC_SOFTMAX_TOP_P.get():
+            return cls.jit(*args, **kwargs)
         return cls.triton(*args, **kwargs)
 
     @classmethod
@@ -370,6 +382,21 @@ class SoftmaxTemp:
             logits=logits,
             temperatures=temperatures,
             rows_per_request=rows_per_request,
+        )
+
+    @classmethod
+    def jit(
+        cls,
+        *,
+        logits: torch.Tensor,
+        temperatures: torch.Tensor,
+        rows_per_request: int,
+    ) -> torch.Tensor:
+        from sglang.kernels.ops.sampling.softmax_top_p import softmax_top_p_probs
+
+        # each row over many blocks: the Triton kernel's block a row leaves most CUs idle
+        return softmax_top_p_probs(
+            logits, temperatures.reshape(-1), None, rows_per_request=rows_per_request
         )
 
     @classmethod
@@ -772,7 +799,7 @@ class AcceptGreedy:
         cls,
         *,
         candidates: torch.Tensor,
-        target_logits: torch.Tensor,
+        target_logits: Optional[torch.Tensor],
         verify_num_draft_tokens: int,
         cutoff_verify_lens: Optional[torch.Tensor] = None,
         target_predict: Optional[torch.Tensor] = None,
@@ -790,7 +817,7 @@ class AcceptGreedy:
         cls,
         *,
         candidates: torch.Tensor,
-        target_logits: torch.Tensor,
+        target_logits: Optional[torch.Tensor],
         verify_num_draft_tokens: int,
         cutoff_verify_lens: Optional[torch.Tensor] = None,
         target_predict: Optional[torch.Tensor] = None,
@@ -807,7 +834,7 @@ class AcceptGreedy:
 def accept_greedy(
     *,
     candidates: torch.Tensor,
-    target_logits: torch.Tensor,
+    target_logits: Optional[torch.Tensor],
     verify_num_draft_tokens: int,
     cutoff_verify_lens: Optional[torch.Tensor] = None,
     target_predict: Optional[torch.Tensor] = None,
@@ -861,7 +888,7 @@ def gather_row_bonus_triton(*, table: torch.Tensor, idx: torch.Tensor) -> torch.
 def accept_greedy_triton(
     *,
     candidates: torch.Tensor,
-    target_logits: torch.Tensor,
+    target_logits: Optional[torch.Tensor],
     verify_num_draft_tokens: int,
     cutoff_verify_lens: Optional[torch.Tensor] = None,
     target_predict: Optional[torch.Tensor] = None,
@@ -903,11 +930,15 @@ class FinalizeAcceptLens:
         correct_len: torch.Tensor,
         cap_trim_lens: torch.Tensor,
         prefix_lens: torch.Tensor,
+        bonus: Optional[torch.Tensor] = None,
+        out=None,
     ) -> FinalizeAcceptLensResult:
         return finalize_accept_lens(
             correct_len=correct_len,
             cap_trim_lens=cap_trim_lens,
             prefix_lens=prefix_lens,
+            bonus=bonus,
+            out=out,
         )
 
     @classmethod
@@ -917,11 +948,15 @@ class FinalizeAcceptLens:
         correct_len: torch.Tensor,
         cap_trim_lens: torch.Tensor,
         prefix_lens: torch.Tensor,
+        bonus: Optional[torch.Tensor] = None,
+        out=None,
     ) -> FinalizeAcceptLensResult:
         return finalize_accept_lens_triton(
             correct_len=correct_len,
             cap_trim_lens=cap_trim_lens,
             prefix_lens=prefix_lens,
+            bonus=bonus,
+            out=out,
         )
 
 
@@ -930,13 +965,27 @@ def finalize_accept_lens(
     correct_len: torch.Tensor,
     cap_trim_lens: torch.Tensor,
     prefix_lens: torch.Tensor,
+    bonus: Optional[torch.Tensor] = None,
+    out=None,
 ) -> FinalizeAcceptLensResult:
     commit_lens = correct_len.to(torch.int32) + 1
     new_seq_lens = prefix_lens + commit_lens.to(prefix_lens.dtype)
-    return FinalizeAcceptLensResult(
+    result = FinalizeAcceptLensResult(
         commit_lens=commit_lens,
         new_seq_lens=new_seq_lens,
         cap_trim_lens=cap_trim_lens.to(torch.int32),
+    )
+    if out is None:
+        return result
+    out.correct_len.copy_(correct_len)
+    out.bonus.copy_(bonus)
+    out.cap_trim_lens.copy_(result.cap_trim_lens)
+    out.commit_lens.copy_(result.commit_lens)
+    out.new_seq_lens.copy_(result.new_seq_lens)
+    return FinalizeAcceptLensResult(
+        commit_lens=out.commit_lens,
+        new_seq_lens=out.new_seq_lens,
+        cap_trim_lens=out.cap_trim_lens,
     )
 
 
@@ -948,17 +997,30 @@ def _finalize_accept_lens_kernel(
     commit_lens_ptr,
     new_seq_lens_ptr,
     cap_trim_out_ptr,
+    bonus_ptr,
+    correct_len_out_ptr,
+    bonus_out_ptr,
     bs,
     BLOCK: tl.constexpr,
+    THROUGH: tl.constexpr,
 ):
     offs = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
     mask = offs < bs
-    commit = tl.load(correct_len_ptr + offs, mask=mask, other=0).to(tl.int32) + 1
+    correct = tl.load(correct_len_ptr + offs, mask=mask, other=0)
+    commit = correct.to(tl.int32) + 1
     prefix = tl.load(prefix_lens_ptr + offs, mask=mask, other=0)
     trim = tl.load(cap_trim_ptr + offs, mask=mask, other=0).to(tl.int32)
     tl.store(commit_lens_ptr + offs, commit, mask=mask)
-    tl.store(new_seq_lens_ptr + offs, prefix + commit, mask=mask)
+    new_seq = (prefix + commit).to(new_seq_lens_ptr.dtype.element_ty)
+    tl.store(new_seq_lens_ptr + offs, new_seq, mask=mask)
     tl.store(cap_trim_out_ptr + offs, trim, mask=mask)
+    if THROUGH:
+        out_dtype = correct_len_out_ptr.dtype.element_ty
+        tl.store(correct_len_out_ptr + offs, correct.to(out_dtype), mask=mask)
+        bonus = tl.load(bonus_ptr + offs, mask=mask, other=0)
+        tl.store(
+            bonus_out_ptr + offs, bonus.to(bonus_out_ptr.dtype.element_ty), mask=mask
+        )
 
 
 def finalize_accept_lens_triton(
@@ -966,13 +1028,27 @@ def finalize_accept_lens_triton(
     correct_len: torch.Tensor,
     cap_trim_lens: torch.Tensor,
     prefix_lens: torch.Tensor,
+    bonus: Optional[torch.Tensor] = None,
+    out=None,
 ) -> FinalizeAcceptLensResult:
+    """``out``: static buffers (``correct_len``, ``bonus``, ``cap_trim_lens``,
+    ``commit_lens``, ``new_seq_lens``) the lengths land in, with ``correct_len``
+    and ``bonus`` copied through in the same launch."""
     bs = correct_len.shape[0]
     device = correct_len.device
 
-    commit_lens = torch.empty(bs, dtype=torch.int32, device=device)
-    new_seq_lens = torch.empty(bs, dtype=prefix_lens.dtype, device=device)
-    cap_trim_out = torch.empty(bs, dtype=torch.int32, device=device)
+    if out is None:
+        commit_lens = torch.empty(bs, dtype=torch.int32, device=device)
+        new_seq_lens = torch.empty(bs, dtype=prefix_lens.dtype, device=device)
+        cap_trim_out = torch.empty(bs, dtype=torch.int32, device=device)
+    else:
+        assert bonus is not None
+        commit_lens, new_seq_lens, cap_trim_out = (
+            out.commit_lens,
+            out.new_seq_lens,
+            out.cap_trim_lens,
+        )
+        assert commit_lens.dtype == cap_trim_out.dtype == torch.int32
     BLOCK = 256
     _finalize_accept_lens_kernel[(triton.cdiv(bs, BLOCK),)](
         correct_len,
@@ -981,8 +1057,12 @@ def finalize_accept_lens_triton(
         commit_lens,
         new_seq_lens,
         cap_trim_out,
+        correct_len if bonus is None else bonus,
+        correct_len if out is None else out.correct_len,
+        correct_len if out is None else out.bonus,
         bs,
         BLOCK=BLOCK,
+        THROUGH=out is not None,
     )
     return FinalizeAcceptLensResult(
         commit_lens=commit_lens,
